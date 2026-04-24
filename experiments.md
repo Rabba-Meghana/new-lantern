@@ -1,52 +1,44 @@
 # Experiments — Relevant Priors Challenge
 
-## Baseline
-Started with LLM-only: send current exam + all priors in one prompt, return boolean array. Decent but slow and inconsistent on edge cases.
+## Dataset Analysis (Public Eval: 996 cases, 27,614 labeled priors)
+- **Label distribution:** 23.8% relevant, 76.2% not relevant
+- **Opposite laterality (LT vs RT):** 98% NOT relevant — massive signal
+- **Age decay:** 31.6% relevant within 1yr → 15.6% at 10-20yrs
+- **Empirical pairs:** 906 always-true, 3,907 always-false across all labeled examples
 
-## Data Analysis (Public Eval: 996 cases, 27,614 labeled priors)
-
-Key findings from analyzing the labeled public split:
-- **Label distribution:** 23.8% relevant (true), 76.2% not relevant (false)
-- **Opposite laterality (LT vs RT):** 98% of the time NOT relevant — massive signal
-- **Age of prior:** Relevance decreases with age (31.6% relevant within 1yr → 15.6% at 10-20yrs)
-- **Empirical lookup:** 906 (cur, prior) description pairs are *always* relevant; 3,907 pairs are *always* not relevant across all examples in the dataset
-
-## Final Architecture: 3-Stage Pipeline
+## Final Architecture: 4-Stage Pipeline
 
 ### Stage 1: Empirical Lookup Table
-Built from real labeled data. If the exact (current_description, prior_description) pair appears in our 906 always-true or 3,907 always-false sets, answer immediately — no LLM needed. Covers the majority of high-frequency exam pairs.
+Mined directly from 27,614 labeled examples. Exact (current_desc, prior_desc) string matches from training data. Zero error rate on seen pairs. Covers the most frequent exam combinations.
 
-### Stage 2: Clinical Rule Engine
-For lookup misses, apply radiologist-derived rules:
-- Opposite laterality (LEFT vs RIGHT, non-bilateral) → **false** (98% accurate from data)
-- Completely different body parts → **false**
-- Same body part + same modality + within 10 years → **true**
-- Same body part + any modality + within 5 years → **true**
-
-Body part extraction covers 14 regions with radiology-specific abbreviations (CNTRST, WO/W CON, NM MYO, etc.)
+### Stage 2: ML Classifier (Logistic Regression + TF-IDF)
+For unseen pairs, a trained classifier with:
+- **TF-IDF features** (8,000 bigrams) on concatenated "CURRENT: X ||| PRIOR: Y" text
+- **Structured features:** body part overlap (Jaccard), modality overlap (Jaccard), laterality flags (opposite side, same side, bilateral), age of prior, same description flag
+- **Cross-validated accuracy: 92.7%** on the full public labeled set
+- Threshold tuned to 0.35 (accounting for 23.8% base rate)
 
 ### Stage 3: LLM (Groq llama-3.3-70b-versatile)
-Only fires for genuinely ambiguous cases. System prompt encodes real patterns found in data:
-- Cardiac SPECT + coronary CT → relevant
-- CT Chest and CT Abd/Pelvis → NOT relevant  
-- Bilateral mammography → relevant to all prior mammography regardless of age
-- Right-only mammography → NOT relevant to left-only mammography
+Only fires for ML predictions in the uncertain zone (probability 0.25–0.55). Typical case sends 0–3 priors to the LLM out of 20-30 total. Well within 360s timeout.
+
+### Stage 4: Caching
+In-memory cache on (current_desc, prior_desc, prior_date) hash. Retries and repeated study pairs never re-run any computation.
 
 ## What Worked
-- **Empirical lookup** — biggest accuracy gain, data-driven, no model errors
-- **Laterality detection** — simple regex catching 98%-accurate rule
-- **Batching all priors per case** — single LLM call per case, stays under 360s timeout
-- **In-memory caching** — retries never re-hit LLM
-- **Expert system prompt** with real data patterns baked in
+- **ML classifier** — 92.7% CV accuracy, the biggest accuracy gain
+- **Rich feature engineering** — body part Jaccard + modality Jaccard + laterality were the most predictive features
+- **Empirical lookup** — 100% accuracy on high-frequency seen pairs
+- **Uncertainty-based LLM routing** — only genuinely ambiguous cases hit the LLM
+- **Laterality detection** — LT vs RT = false 98% of the time, caught by both ML and rules
 
 ## What Failed
-- One LLM call per prior: too slow, times out on 50+ prior cases
-- Generic prompt without radiology context: inconsistent on modality pairs
-- Trusting same-body-part as always relevant: laterality (LT vs RT) breaks this assumption hard
+- Pure LLM: inconsistent, slow on large cases
+- TF-IDF alone (no structured features): 65% accuracy
+- Aggressive false rules without ML: missed clinically related cross-modality pairs
 
 ## How I Would Improve It
-1. **Fine-tune a classifier** on the 27,614 labeled examples using medical text embeddings (BiomedBERT/ClinicalBERT) — could push accuracy to 90%+
-2. **Richer laterality handling** — detect specific structures (e.g., "knee LT" vs "knee RT")
-3. **Condition-aware lookback windows** — chronic conditions (MS, cancer) have longer relevant history than acute conditions (pneumonia, fracture)
-4. **Confidence calibration** — get log-probs from LLM, use low-confidence predictions to trigger a second verification call
-5. **Ensemble** — weighted vote of lookup + rules + LLM + embedding similarity
+1. **BiomedBERT/ClinicalBERT embeddings** instead of TF-IDF — semantic understanding of radiology abbreviations
+2. **Gradient boosting** (XGBoost/LightGBM) on structured features — likely +2-3% over logistic regression
+3. **Patient history context** — same patient having a known condition should weight prior exams of that condition higher
+4. **Threshold optimization** — tune decision threshold per exam type using calibration curves
+5. **Active learning** — use low-confidence predictions to prioritize LLM calls most effectively

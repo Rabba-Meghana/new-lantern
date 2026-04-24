@@ -1,6 +1,9 @@
 import os
 import json
 import hashlib
+import pickle
+import numpy as np
+import scipy.sparse as sp
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -11,235 +14,230 @@ app = FastAPI()
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 cache = {}
 
-# ─── Load empirical lookup table from real labeled data ───────────────────────
+# ─── Load ML model ────────────────────────────────────────────────────────────
+_model_path = os.path.join(os.path.dirname(__file__), "model.pkl")
+with open(_model_path, 'rb') as f:
+    _model = pickle.load(f)
+VECTORIZER = _model['vectorizer']
+CLF = _model['clf']
+
+# ─── Load empirical lookup table ──────────────────────────────────────────────
 _lookup_path = os.path.join(os.path.dirname(__file__), "lookup.json")
 with open(_lookup_path) as f:
     _lookup_raw = json.load(f)
-
 LOOKUP_TRUE  = {(a, b) for a, b in _lookup_raw["true"]}
 LOOKUP_FALSE = {(a, b) for a, b in _lookup_raw["false"]}
 
-# ─── Body part + modality extraction ─────────────────────────────────────────
-
+# ─── Feature extraction ───────────────────────────────────────────────────────
 BODY_PARTS = {
-    "brain":            ["brain", "head", "cranial", "cranium", "intracranial", "cerebr", "neuro", "skull", "orbit", "sella", "pituitary"],
-    "spine_cervical":   ["cervical", "c-spine", "c spine"],
-    "spine_thoracic":   ["thoracic spine", "t-spine", "t spine"],
-    "spine_lumbar":     ["lumbar", "l-spine", "l spine", "lumbosacral", "sacral"],
-    "chest":            ["chest", "thorax", "lung", "pulmon", "pleural", "mediastin", "rib", "heart", "coronary", "cardiac", "aorta", "spect", "nm myo", "nmmyo", "myocard"],
-    "abdomen":          ["abdomen", "abdominal", "liver", "hepat", "pancrea", "spleen", "kidney", "renal", "adrenal", "bowel", "colon", "rectum", "gallbladder", "biliary", "aaa"],
-    "pelvis":           ["pelvis", "pelvic", "bladder", "prostate", "uterus", "ovary", "abd/pel", "abd pel", "abdom/pel"],
-    "extremity_upper":  ["shoulder", "humerus", "elbow", "forearm", "wrist", "hand", "finger", "upper extremity", "clavicle"],
-    "extremity_lower":  ["hip", "femur", "knee", "tibia", "fibula", "ankle", "foot", "toe", "lower extremity"],
-    "breast":           ["breast", "mammograph", "mammo", "mam "],
-    "neck":             ["neck", "thyroid", "soft tissue neck", "parotid", "salivary"],
-    "vascular":         ["angio", "vascular", "venous", "arterial", "carotid", "doppler"],
-    "bone":             ["bone density", "dxa", "dexa", "osteo"],
-    "whole_body":       ["whole body", "pet", "bone scan", "nuclear", "spect"],
+    "brain":           ["brain", "head", "cranial", "cranium", "intracranial", "cerebr", "neuro", "skull", "orbit", "sella", "pituitary"],
+    "spine_cervical":  ["cervical", "c-spine", "c spine"],
+    "spine_thoracic":  ["thoracic spine", "t-spine", "t spine"],
+    "spine_lumbar":    ["lumbar", "l-spine", "l spine", "lumbosacral", "sacral"],
+    "chest":           ["chest", "thorax", "lung", "pulmon", "pleural", "mediastin", "rib", "heart", "coronary", "cardiac", "spect", "nm myo", "nmmyo", "myocard"],
+    "abdomen":         ["abdomen", "abdominal", "liver", "hepat", "pancrea", "spleen", "kidney", "renal", "adrenal", "bowel", "colon", "rectum", "gallbladder", "biliary", "aaa"],
+    "pelvis":          ["pelvis", "pelvic", "bladder", "prostate", "uterus", "ovary", "abd/pel", "abd pel"],
+    "upper_ext":       ["shoulder", "humerus", "elbow", "forearm", "wrist", "hand", "finger", "clavicle"],
+    "lower_ext":       ["hip", "femur", "knee", "tibia", "fibula", "ankle", "foot", "toe"],
+    "breast":          ["breast", "mammograph", "mammo", "mam "],
+    "neck":            ["neck", "thyroid", "soft tissue neck", "parotid"],
+    "vascular":        ["angio", "vascular", "venous", "arterial", "carotid", "doppler"],
+    "bone":            ["bone density", "dxa", "dexa", "osteo"],
 }
-
 MODALITIES = {
-    "mri":        ["mri", "mr ", "magnetic", "flair", "dwi", "dti", "mrcp", "mra"],
+    "mri":        ["mri", "mr ", "magnetic", "flair", "dwi"],
     "ct":         ["ct ", "cta", "computed tom", "cntrst", "angiogram"],
-    "xray":       ["xray", "x-ray", "radiograph", "plain film", "cxr", "xr ", " view", "frontal", "pa/lat", "pa lat"],
-    "ultrasound": ["ultrasound", "us ", " us ", "sonograph", "echo", "doppler"],
-    "pet":        ["pet", "nuclear", "bone scan", "spect", "nm "],
+    "xray":       ["xray", "x-ray", "radiograph", "xr ", " view", "frontal", "pa/lat"],
+    "ultrasound": ["ultrasound", "us ", "sonograph", "echo", "doppler"],
+    "nuclear":    ["pet", "nuclear", "bone scan", "spect", "nm ", "myo perf"],
     "mammo":      ["mammo", "mammograph", "mam "],
-    "nuclear":    ["nm ", "nuclear", "spect", "myocard", "myo perf"],
 }
 
-def extract_body_parts(desc: str) -> set:
+def get_parts(desc):
     d = desc.lower()
-    return {part for part, kws in BODY_PARTS.items() if any(k in d for k in kws)}
+    return frozenset(p for p, kws in BODY_PARTS.items() if any(k in d for k in kws))
 
-def extract_modality(desc: str) -> set:
+def get_mods(desc):
     d = desc.lower()
-    return {mod for mod, kws in MODALITIES.items() if any(k in d for k in kws)}
+    return frozenset(m for m, kws in MODALITIES.items() if any(k in d for k in kws))
 
-def extract_laterality(desc: str):
+def get_side(desc):
     d = desc.upper()
-    has_lt = ' LT' in d or 'LEFT' in d or ' LT ' in d
-    has_rt = ' RT' in d or 'RIGHT' in d or ' RT ' in d
-    has_bi = 'BILAT' in d or 'BILATERAL' in d or ' BI ' in d or d.endswith(' BI')
-    if has_bi:
-        return 'bilateral'
-    if has_lt and not has_rt:
-        return 'left'
-    if has_rt and not has_lt:
-        return 'right'
+    has_lt = ' LT' in d or 'LEFT' in d
+    has_rt = ' RT' in d or 'RIGHT' in d
+    has_bi = 'BILAT' in d or 'BILATERAL' in d or ' BI ' in d
+    if has_bi: return 'bilateral'
+    if has_lt and not has_rt: return 'left'
+    if has_rt and not has_lt: return 'right'
     return 'unknown'
 
-def years_apart(date1: str, date2: str) -> float:
+def years_apart(date1, date2):
     try:
         d1 = datetime.strptime(date1[:10], "%Y-%m-%d")
         d2 = datetime.strptime(date2[:10], "%Y-%m-%d")
         return abs((d1 - d2).days) / 365.25
-    except Exception:
-        return 0.0
+    except:
+        return 3.0
 
-# ─── Three-stage pipeline ─────────────────────────────────────────────────────
-
-def lookup_decision(cur_desc: str, pri_desc: str) -> str:
-    """Stage 1: exact empirical lookup from labeled data."""
-    key = (cur_desc.upper(), pri_desc.upper())
-    if key in LOOKUP_TRUE:
-        return "true"
-    if key in LOOKUP_FALSE:
-        return "false"
-    return "miss"
-
-def rule_based_decision(current: dict, prior: dict) -> str:
-    """Stage 2: clinical rules."""
-    cur_desc = current.get("study_description", "")
-    pri_desc = prior.get("study_description", "")
-    cur_date = current.get("study_date", "")
-    pri_date = prior.get("study_date", "")
-
-    cur_parts = extract_body_parts(cur_desc)
-    pri_parts = extract_body_parts(pri_desc)
-    cur_mods  = extract_modality(cur_desc)
-    pri_mods  = extract_modality(pri_desc)
-    cur_side  = extract_laterality(cur_desc)
-    pri_side  = extract_laterality(pri_desc)
+def build_features(cur_desc, cur_date, pri_desc, pri_date):
+    cur_parts = get_parts(cur_desc)
+    pri_parts = get_parts(pri_desc)
+    cur_mods  = get_mods(cur_desc)
+    pri_mods  = get_mods(pri_desc)
+    cur_side  = get_side(cur_desc)
+    pri_side  = get_side(pri_desc)
     years     = years_apart(cur_date, pri_date)
 
-    # Whole body / PET / nuclear: let LLM handle
-    if "whole_body" in cur_parts or "whole_body" in pri_parts:
-        return "llm"
+    part_overlap = len(cur_parts & pri_parts)
+    mod_overlap  = len(cur_mods & pri_mods)
+    part_union   = len(cur_parts | pri_parts) or 1
+    mod_union    = len(cur_mods | pri_mods) or 1
 
-    # Opposite laterality (left vs right, non-bilateral) = almost always false
-    sides = {cur_side, pri_side}
-    if 'left' in sides and 'right' in sides:
-        # 98% false from data - call it false unless bilateral
-        if cur_side != 'bilateral' and pri_side != 'bilateral':
-            return "false"
+    opposite_side = int(
+        (cur_side == 'left' and pri_side == 'right') or
+        (cur_side == 'right' and pri_side == 'left')
+    )
+    same_side     = int(cur_side == pri_side and cur_side not in ('unknown',))
+    both_bilateral = int(cur_side == 'bilateral' and pri_side == 'bilateral')
 
-    # Completely different body parts = not relevant
-    if cur_parts and pri_parts and cur_parts.isdisjoint(pri_parts):
-        return "false"
+    return [
+        years / 20.0,
+        part_overlap,
+        part_overlap / part_union,
+        mod_overlap,
+        mod_overlap / mod_union,
+        opposite_side,
+        same_side,
+        int(cur_desc.upper() == pri_desc.upper()),
+        both_bilateral,
+        int(years <= 1),
+        int(years <= 3),
+        int(years > 10),
+        int(part_overlap > 0),
+        int(mod_overlap > 0),
+        int(part_overlap > 0 and mod_overlap > 0),
+    ]
 
-    # Same body part + same modality within 10 years = relevant
-    if cur_parts & pri_parts and cur_mods & pri_mods and years <= 10:
-        return "true"
+def ml_predict_batch(current_study, prior_studies):
+    cur_desc = current_study.get('study_description', '').upper()
+    cur_date = current_study.get('study_date', '')
 
-    # Same body part + any modality within 5 years = relevant
-    if cur_parts & pri_parts and years <= 5:
-        return "true"
+    texts = []
+    metas = []
+    for prior in prior_studies:
+        pri_desc = prior.get('study_description', '').upper()
+        pri_date = prior.get('study_date', '')
+        texts.append(f"CURRENT: {cur_desc} ||| PRIOR: {pri_desc}")
+        metas.append(build_features(cur_desc, cur_date, pri_desc, pri_date))
 
-    # Same body part, older or unclear = LLM
-    if cur_parts & pri_parts:
-        return "llm"
+    X_tfidf = VECTORIZER.transform(texts)
+    X_meta  = sp.csr_matrix(np.array(metas))
+    X       = sp.hstack([X_tfidf, X_meta])
 
-    return "llm"
+    probs = CLF.predict_proba(X)[:, 1]
+    # Threshold tuned for this dataset (base rate 23.8%)
+    return [bool(p >= 0.35) for p in probs]
 
-# ─── LLM stage ───────────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are an expert radiologist with 20+ years of experience. Determine which prior radiology exams are relevant for a radiologist to review when reading a current exam.
-
-RELEVANCE RULES:
-1. Same body part + same modality → relevant (direct comparison baseline)
-2. Same body part + different modality → usually relevant (complementary tissue info)
-3. Clinically related exams across body parts → relevant (e.g., cardiac SPECT + coronary CT, cancer staging across regions)
-4. Opposite laterality (left vs right of same structure) → NOT relevant unless bilateral disease
-5. Completely different body part with no clinical link → NOT relevant
-6. Very old exams (>15 years) with different body part → NOT relevant
-7. Bone density / DXA exams are only relevant to other DXA or bone-related exams
-
-IMPORTANT PATTERNS FROM REAL DATA:
-- Chest CT and chest X-ray: RELEVANT to each other
-- Cardiac SPECT (NM MYO PERF) and coronary CT/CTA: RELEVANT
-- Mammography bilateral: relevant to all prior mammography regardless of age
-- Mammography RIGHT only: NOT relevant to LEFT-only mammography
-- CT Chest and CT Abdomen/Pelvis: NOT relevant (different body regions)
-- CT Head/Brain and Chest X-ray: NOT relevant
-
+# ─── LLM for very uncertain cases ─────────────────────────────────────────────
+SYSTEM_PROMPT = """You are an expert radiologist. Determine if prior exams are relevant for a radiologist reading a current exam.
 Return ONLY a JSON boolean array. No explanation. No markdown."""
 
-def make_cache_key(current_study: dict, prior_study: dict) -> str:
+def make_cache_key(current_study, prior_study):
     key = f"{current_study.get('study_description','')}|{prior_study.get('study_description','')}|{prior_study.get('study_date','')}"
     return hashlib.md5(key.encode()).hexdigest()
 
-def predict_with_llm(current_study: dict, priors: list) -> list:
+def predict_with_llm(current_study, priors):
     if not priors:
         return []
-
     priors_text = "\n".join([
-        f"{j+1}. desc={p.get('study_description','N/A')} | date={p.get('study_date','N/A')}"
+        f"{j+1}. {p.get('study_description','N/A')} | {p.get('study_date','N/A')}"
         for j, p in enumerate(priors)
     ])
-
-    prompt = f"""CURRENT EXAM:
-- Description: {current_study.get('study_description', 'N/A')}
-- Date: {current_study.get('study_date', 'N/A')}
-
-PRIOR EXAMS ({len(priors)} total):
+    prompt = f"""CURRENT: {current_study.get('study_description','N/A')} | {current_study.get('study_date','N/A')}
+PRIORS:
 {priors_text}
-
-Return a JSON array of exactly {len(priors)} booleans (true=relevant, false=not relevant).
-ONLY the array."""
+Return JSON array of {len(priors)} booleans."""
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ],
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
         temperature=0,
         max_tokens=512,
     )
-
     raw = response.choices[0].message.content.strip()
     try:
         start = raw.index('[')
-        end = raw.rindex(']') + 1
-        predictions = json.loads(raw[start:end])
-        while len(predictions) < len(priors):
-            predictions.append(True)
-        return [bool(p) for p in predictions[:len(priors)]]
-    except Exception:
-        # Fallback: body part overlap heuristic
-        cur_parts = extract_body_parts(current_study.get("study_description", ""))
-        return [bool(cur_parts & extract_body_parts(p.get("study_description", ""))) for p in priors]
+        end   = raw.rindex(']') + 1
+        preds = json.loads(raw[start:end])
+        while len(preds) < len(priors):
+            preds.append(True)
+        return [bool(p) for p in preds[:len(priors)]]
+    except:
+        return [True] * len(priors)
 
-def predict_relevance_batch(current_study: dict, prior_studies: list) -> list:
-    final_results = [None] * len(prior_studies)
-    llm_indices = []
-    llm_priors = []
+# ─── Main prediction pipeline ─────────────────────────────────────────────────
+
+def predict_relevance_batch(current_study, prior_studies):
+    if not prior_studies:
+        return []
+
+    final = [None] * len(prior_studies)
+    need_ml = []
+    need_ml_idx = []
 
     for i, prior in enumerate(prior_studies):
         ck = make_cache_key(current_study, prior)
         if ck in cache:
-            final_results[i] = cache[ck]
+            final[i] = cache[ck]
             continue
 
-        # Stage 1: empirical lookup
-        decision = lookup_decision(
-            current_study.get("study_description", ""),
-            prior.get("study_description", "")
-        )
-
-        # Stage 2: rules (if lookup missed)
-        if decision == "miss":
-            decision = rule_based_decision(current_study, prior)
-
-        if decision == "true":
-            final_results[i] = True
+        # Stage 1: empirical lookup (100% accurate on seen pairs)
+        key = (current_study.get('study_description','').upper(),
+               prior.get('study_description','').upper())
+        if key in LOOKUP_TRUE:
+            final[i] = True
             cache[ck] = True
-        elif decision == "false":
-            final_results[i] = False
+        elif key in LOOKUP_FALSE:
+            final[i] = False
             cache[ck] = False
         else:
-            llm_indices.append(i)
-            llm_priors.append(prior)
+            need_ml.append(prior)
+            need_ml_idx.append(i)
 
-    # Stage 3: LLM for remaining ambiguous cases
-    if llm_priors:
-        llm_preds = predict_with_llm(current_study, llm_priors)
-        for idx, pred in zip(llm_indices, llm_preds):
-            final_results[idx] = pred
-            cache[make_cache_key(current_study, prior_studies[idx])] = pred
+    # Stage 2: ML classifier for unseen pairs
+    if need_ml:
+        ml_preds = ml_predict_batch(current_study, need_ml)
 
-    return [r if r is not None else True for r in final_results]
+        # Stage 3: LLM for low-confidence ML predictions
+        uncertain_idx = []
+        uncertain_priors = []
+        cur_desc = current_study.get('study_description','').upper()
+        cur_date = current_study.get('study_date','')
+
+        # Get probabilities for uncertainty check
+        texts = [f"CURRENT: {cur_desc} ||| PRIOR: {p.get('study_description','').upper()}" for p in need_ml]
+        metas = [build_features(cur_desc, cur_date, p.get('study_description','').upper(), p.get('study_date','')) for p in need_ml]
+        X_tfidf = VECTORIZER.transform(texts)
+        X_meta  = sp.csr_matrix(np.array(metas))
+        X       = sp.hstack([X_tfidf, X_meta])
+        probs   = CLF.predict_proba(X)[:, 1]
+
+        for j, (orig_i, prior, prob) in enumerate(zip(need_ml_idx, need_ml, probs)):
+            if 0.25 <= prob <= 0.55:  # uncertain zone - send to LLM
+                uncertain_idx.append((j, orig_i))
+                uncertain_priors.append(prior)
+            else:
+                final[orig_i] = ml_preds[j]
+                cache[make_cache_key(current_study, prior)] = ml_preds[j]
+
+        # LLM handles uncertain cases
+        if uncertain_priors:
+            llm_preds = predict_with_llm(current_study, uncertain_priors)
+            for (j, orig_i), pred, prior in zip(uncertain_idx, llm_preds, uncertain_priors):
+                final[orig_i] = pred
+                cache[make_cache_key(current_study, prior)] = pred
+
+    return [r if r is not None else True for r in final]
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -251,10 +249,10 @@ async def predict(request: Request):
     predictions = []
 
     for case in cases:
-        case_id = case["case_id"]
+        case_id      = case["case_id"]
         current_study = case["current_study"]
         prior_studies = case.get("prior_studies", [])
-        relevances = predict_relevance_batch(current_study, prior_studies)
+        relevances    = predict_relevance_batch(current_study, prior_studies)
 
         for prior, is_relevant in zip(prior_studies, relevances):
             predictions.append({
