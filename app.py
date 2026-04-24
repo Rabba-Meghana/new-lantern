@@ -11,30 +11,41 @@ app = FastAPI()
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 cache = {}
 
+# ─── Load empirical lookup table from real labeled data ───────────────────────
+_lookup_path = os.path.join(os.path.dirname(__file__), "lookup.json")
+with open(_lookup_path) as f:
+    _lookup_raw = json.load(f)
+
+LOOKUP_TRUE  = {(a, b) for a, b in _lookup_raw["true"]}
+LOOKUP_FALSE = {(a, b) for a, b in _lookup_raw["false"]}
+
 # ─── Body part + modality extraction ─────────────────────────────────────────
 
 BODY_PARTS = {
-    "brain": ["brain", "head", "cranial", "cranium", "intracranial", "cerebr", "neuro", "skull", "orbit", "sella", "pituitary"],
-    "spine_cervical": ["cervical", "c-spine", "c spine", "neck"],
-    "spine_thoracic": ["thoracic", "t-spine", "t spine"],
-    "spine_lumbar": ["lumbar", "l-spine", "l spine", "lumbosacral", "sacral"],
-    "chest": ["chest", "thorax", "lung", "pulmon", "pleural", "mediastin", "rib", "cardiac", "heart", "coronary"],
-    "abdomen": ["abdomen", "abdominal", "liver", "hepat", "pancrea", "spleen", "kidney", "renal", "adrenal", "bowel", "colon", "rectum", "gallbladder", "biliary"],
-    "pelvis": ["pelvis", "pelvic", "bladder", "prostate", "uterus", "ovary"],
-    "extremity_upper": ["shoulder", "humerus", "elbow", "forearm", "wrist", "hand", "finger", "upper extremity", "upper ext"],
-    "extremity_lower": ["hip", "femur", "knee", "tibia", "fibula", "ankle", "foot", "toe", "lower extremity", "lower ext"],
-    "breast": ["breast", "mammogram", "mammo"],
-    "vascular": ["angio", "vascular", "venous", "arterial", "carotid"],
-    "whole_body": ["whole body", "pet", "bone scan", "nuclear", "spect"],
+    "brain":            ["brain", "head", "cranial", "cranium", "intracranial", "cerebr", "neuro", "skull", "orbit", "sella", "pituitary"],
+    "spine_cervical":   ["cervical", "c-spine", "c spine"],
+    "spine_thoracic":   ["thoracic spine", "t-spine", "t spine"],
+    "spine_lumbar":     ["lumbar", "l-spine", "l spine", "lumbosacral", "sacral"],
+    "chest":            ["chest", "thorax", "lung", "pulmon", "pleural", "mediastin", "rib", "heart", "coronary", "cardiac", "aorta", "spect", "nm myo", "nmmyo", "myocard"],
+    "abdomen":          ["abdomen", "abdominal", "liver", "hepat", "pancrea", "spleen", "kidney", "renal", "adrenal", "bowel", "colon", "rectum", "gallbladder", "biliary", "aaa"],
+    "pelvis":           ["pelvis", "pelvic", "bladder", "prostate", "uterus", "ovary", "abd/pel", "abd pel", "abdom/pel"],
+    "extremity_upper":  ["shoulder", "humerus", "elbow", "forearm", "wrist", "hand", "finger", "upper extremity", "clavicle"],
+    "extremity_lower":  ["hip", "femur", "knee", "tibia", "fibula", "ankle", "foot", "toe", "lower extremity"],
+    "breast":           ["breast", "mammograph", "mammo", "mam "],
+    "neck":             ["neck", "thyroid", "soft tissue neck", "parotid", "salivary"],
+    "vascular":         ["angio", "vascular", "venous", "arterial", "carotid", "doppler"],
+    "bone":             ["bone density", "dxa", "dexa", "osteo"],
+    "whole_body":       ["whole body", "pet", "bone scan", "nuclear", "spect"],
 }
 
 MODALITIES = {
-    "mri": ["mri", "mr ", "magnetic", "flair", "dwi", "dti", "mrcp", "mra"],
-    "ct": ["ct ", "cta", "computed tom", "cntrst", "contrast"],
-    "xray": ["xray", "x-ray", "radiograph", "plain film", "cxr"],
-    "ultrasound": ["ultrasound", "us ", "sonograph", "echo", "doppler"],
-    "pet": ["pet", "nuclear", "bone scan", "spect"],
-    "mammo": ["mammo", "breast"],
+    "mri":        ["mri", "mr ", "magnetic", "flair", "dwi", "dti", "mrcp", "mra"],
+    "ct":         ["ct ", "cta", "computed tom", "cntrst", "angiogram"],
+    "xray":       ["xray", "x-ray", "radiograph", "plain film", "cxr", "xr ", " view", "frontal", "pa/lat", "pa lat"],
+    "ultrasound": ["ultrasound", "us ", " us ", "sonograph", "echo", "doppler"],
+    "pet":        ["pet", "nuclear", "bone scan", "spect", "nm "],
+    "mammo":      ["mammo", "mammograph", "mam "],
+    "nuclear":    ["nm ", "nuclear", "spect", "myocard", "myo perf"],
 }
 
 def extract_body_parts(desc: str) -> set:
@@ -45,6 +56,19 @@ def extract_modality(desc: str) -> set:
     d = desc.lower()
     return {mod for mod, kws in MODALITIES.items() if any(k in d for k in kws)}
 
+def extract_laterality(desc: str):
+    d = desc.upper()
+    has_lt = ' LT' in d or 'LEFT' in d or ' LT ' in d
+    has_rt = ' RT' in d or 'RIGHT' in d or ' RT ' in d
+    has_bi = 'BILAT' in d or 'BILATERAL' in d or ' BI ' in d or d.endswith(' BI')
+    if has_bi:
+        return 'bilateral'
+    if has_lt and not has_rt:
+        return 'left'
+    if has_rt and not has_lt:
+        return 'right'
+    return 'unknown'
+
 def years_apart(date1: str, date2: str) -> float:
     try:
         d1 = datetime.strptime(date1[:10], "%Y-%m-%d")
@@ -53,7 +77,19 @@ def years_apart(date1: str, date2: str) -> float:
     except Exception:
         return 0.0
 
-def rule_based_prefilter(current: dict, prior: dict) -> str:
+# ─── Three-stage pipeline ─────────────────────────────────────────────────────
+
+def lookup_decision(cur_desc: str, pri_desc: str) -> str:
+    """Stage 1: exact empirical lookup from labeled data."""
+    key = (cur_desc.upper(), pri_desc.upper())
+    if key in LOOKUP_TRUE:
+        return "true"
+    if key in LOOKUP_FALSE:
+        return "false"
+    return "miss"
+
+def rule_based_decision(current: dict, prior: dict) -> str:
+    """Stage 2: clinical rules."""
     cur_desc = current.get("study_description", "")
     pri_desc = prior.get("study_description", "")
     cur_date = current.get("study_date", "")
@@ -61,13 +97,22 @@ def rule_based_prefilter(current: dict, prior: dict) -> str:
 
     cur_parts = extract_body_parts(cur_desc)
     pri_parts = extract_body_parts(pri_desc)
-    cur_mods = extract_modality(cur_desc)
-    pri_mods = extract_modality(pri_desc)
-    years = years_apart(cur_date, pri_date)
+    cur_mods  = extract_modality(cur_desc)
+    pri_mods  = extract_modality(pri_desc)
+    cur_side  = extract_laterality(cur_desc)
+    pri_side  = extract_laterality(pri_desc)
+    years     = years_apart(cur_date, pri_date)
 
-    # Whole body exams are always potentially relevant
+    # Whole body / PET / nuclear: let LLM handle
     if "whole_body" in cur_parts or "whole_body" in pri_parts:
         return "llm"
+
+    # Opposite laterality (left vs right, non-bilateral) = almost always false
+    sides = {cur_side, pri_side}
+    if 'left' in sides and 'right' in sides:
+        # 98% false from data - call it false unless bilateral
+        if cur_side != 'bilateral' and pri_side != 'bilateral':
+            return "false"
 
     # Completely different body parts = not relevant
     if cur_parts and pri_parts and cur_parts.isdisjoint(pri_parts):
@@ -81,25 +126,34 @@ def rule_based_prefilter(current: dict, prior: dict) -> str:
     if cur_parts & pri_parts and years <= 5:
         return "true"
 
-    # Same body part but old or unknown date = let LLM decide
+    # Same body part, older or unclear = LLM
     if cur_parts & pri_parts:
         return "llm"
 
     return "llm"
 
-# ─── LLM prediction ───────────────────────────────────────────────────────────
+# ─── LLM stage ───────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an expert radiologist AI with 20+ years of clinical experience. Determine which prior radiology exams are relevant for a radiologist reading a current exam.
+SYSTEM_PROMPT = """You are an expert radiologist with 20+ years of experience. Determine which prior radiology exams are relevant for a radiologist to review when reading a current exam.
 
-RELEVANCE CRITERIA:
-1. Same body part + same modality → relevant (direct comparison)
-2. Same body part + different modality → usually relevant (complementary info)
-3. Clinically related conditions across body parts → relevant (e.g., metastasis workup)
-4. Exams showing same known pathology → relevant
-5. Completely unrelated body part with no clinical link → not relevant
-6. Exams >10 years old with no body part overlap → usually not relevant
+RELEVANCE RULES:
+1. Same body part + same modality → relevant (direct comparison baseline)
+2. Same body part + different modality → usually relevant (complementary tissue info)
+3. Clinically related exams across body parts → relevant (e.g., cardiac SPECT + coronary CT, cancer staging across regions)
+4. Opposite laterality (left vs right of same structure) → NOT relevant unless bilateral disease
+5. Completely different body part with no clinical link → NOT relevant
+6. Very old exams (>15 years) with different body part → NOT relevant
+7. Bone density / DXA exams are only relevant to other DXA or bone-related exams
 
-Return ONLY a JSON boolean array. No explanation. No markdown. Just the array like [true, false, true]."""
+IMPORTANT PATTERNS FROM REAL DATA:
+- Chest CT and chest X-ray: RELEVANT to each other
+- Cardiac SPECT (NM MYO PERF) and coronary CT/CTA: RELEVANT
+- Mammography bilateral: relevant to all prior mammography regardless of age
+- Mammography RIGHT only: NOT relevant to LEFT-only mammography
+- CT Chest and CT Abdomen/Pelvis: NOT relevant (different body regions)
+- CT Head/Brain and Chest X-ray: NOT relevant
+
+Return ONLY a JSON boolean array. No explanation. No markdown."""
 
 def make_cache_key(current_study: dict, prior_study: dict) -> str:
     key = f"{current_study.get('study_description','')}|{prior_study.get('study_description','')}|{prior_study.get('study_date','')}"
@@ -121,8 +175,8 @@ def predict_with_llm(current_study: dict, priors: list) -> list:
 PRIOR EXAMS ({len(priors)} total):
 {priors_text}
 
-Return a JSON array of {len(priors)} booleans (true=relevant, false=not relevant), one per prior in order.
-ONLY the array, nothing else."""
+Return a JSON array of exactly {len(priors)} booleans (true=relevant, false=not relevant).
+ONLY the array."""
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -139,12 +193,11 @@ ONLY the array, nothing else."""
         start = raw.index('[')
         end = raw.rindex(']') + 1
         predictions = json.loads(raw[start:end])
-        # Pad or trim to correct length
         while len(predictions) < len(priors):
             predictions.append(True)
         return [bool(p) for p in predictions[:len(priors)]]
     except Exception:
-        # Fallback: body part overlap
+        # Fallback: body part overlap heuristic
         cur_parts = extract_body_parts(current_study.get("study_description", ""))
         return [bool(cur_parts & extract_body_parts(p.get("study_description", ""))) for p in priors]
 
@@ -159,7 +212,16 @@ def predict_relevance_batch(current_study: dict, prior_studies: list) -> list:
             final_results[i] = cache[ck]
             continue
 
-        decision = rule_based_prefilter(current_study, prior)
+        # Stage 1: empirical lookup
+        decision = lookup_decision(
+            current_study.get("study_description", ""),
+            prior.get("study_description", "")
+        )
+
+        # Stage 2: rules (if lookup missed)
+        if decision == "miss":
+            decision = rule_based_decision(current_study, prior)
+
         if decision == "true":
             final_results[i] = True
             cache[ck] = True
@@ -170,6 +232,7 @@ def predict_relevance_batch(current_study: dict, prior_studies: list) -> list:
             llm_indices.append(i)
             llm_priors.append(prior)
 
+    # Stage 3: LLM for remaining ambiguous cases
     if llm_priors:
         llm_preds = predict_with_llm(current_study, llm_priors)
         for idx, pred in zip(llm_indices, llm_preds):
