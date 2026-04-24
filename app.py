@@ -58,7 +58,7 @@ Return ONLY a JSON array with true/false for each prior in the same order, like:
 No explanation, just the JSON array."""
 
         response = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=512,
