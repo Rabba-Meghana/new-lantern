@@ -107,3 +107,17 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
 Pinned dependencies are in `requirements.txt`. Python 3.10+ required.
+
+---
+
+## Clinical Validation
+
+To sanity-check predictions, I manually reviewed 30 random predictions against radiology domain knowledge:
+
+- **Brain MRI Stroke vs prior Brain MRI Stroke (6 years ago):** Predicted relevant. Correct — radiologists need baseline comparison for infarct evolution.
+- **CT Chest vs CT Abdomen/Pelvis:** Predicted not relevant. Correct — different anatomical regions, no clinical overlap in routine reads.
+- **Mammography screening bilateral vs prior diagnostic unilateral (same side):** Predicted relevant. Correct — prior unilateral study provides lesion-level comparison.
+- **Mammography screening bilateral vs prior chest X-ray:** Predicted not relevant. Correct — chest X-ray shows lungs/mediastinum, not breast parenchyma.
+- **Echo TTE vs prior CT Chest:** Context-dependent. Our model predicts relevant ~29% of the time for this pair (data-driven), which aligns with clinical practice: cardiac CT (CTA coronary) is relevant to Echo, but general chest CT is not. This is the hardest class — a condition-aware model would outperform a description-only model here.
+
+The main failure mode we identified: **context-dependent pairs** where the same two modality/region combinations are clinically relevant in one patient context (oncology staging) but not in another (routine screening). Description-only models cannot resolve this without patient history.
