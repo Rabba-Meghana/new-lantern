@@ -2,103 +2,130 @@
 
 ## Deployed Architecture
 
-The live endpoint runs a **5-stage hybrid pipeline** with no blocking external calls:
+The live endpoint runs a **5-stage hybrid pipeline**. All thresholds and hyperparameters are in `config.json` — nothing is hard-coded in inference logic.
 
-1. **In-memory cache** — keyed on MD5(cur_desc + cur_date + pri_desc + pri_date). The cur_date is included to prevent incorrect cache reuse across cases where the same prior description appears with a different current study date.
-2. **Empirical lookup table** — 906 always-true + 3,907 always-false (current_desc, prior_desc) pairs mined from the public labeled split
+1. **In-memory cache** — keyed on MD5(cur_desc + cur_date + pri_desc + pri_date). cur_date is included to prevent collisions across cases sharing the same prior description with different current study dates.
+2. **Empirical lookup table** — 906 always-true + 3,907 always-false (current_desc, prior_desc) pairs from public labeled split (min 2 occurrences, no counter-examples)
 3. **Targeted clinical rules** — 3 data-validated rules (see table below)
-4. **Logistic regression** — TF-IDF bigrams + 15 structured features
-5. **ONNX BiomedBERT ensemble** — for sklearn-uncertain predictions (prob 0.25–0.60) only; averaged with sklearn at threshold 0.40
+4. **Logistic regression** — TF-IDF bigrams + 15 structured features (threshold: `config.sklearn_threshold`)
+5. **ONNX BiomedBERT ensemble** — for sklearn predictions in [`config.onnx_uncertainty_low`, `config.onnx_uncertainty_high`]; averaged with sklearn at `config.onnx_threshold`
 
-BiomedBERT loads in a background thread at startup. sklearn handles all requests immediately. The ensemble activates automatically once ONNX is ready (~30s after startup).
+BiomedBERT loads in a background thread. sklearn handles all requests immediately and ONNX activates automatically once ready (~30s after startup). If `onnx_int8/` is absent the server degrades gracefully to sklearn-only.
 
 ---
 
-## Data Analysis (Public Split Only)
+## Data (Public Split Only)
 
-All numbers below are measured on the public labeled split (27,614 priors, 996 cases). The private split is unseen. CV figures are 5-fold on the full public set.
+All measurements are on the public labeled split (27,614 priors, 996 cases). The private split is unseen. CV figures are 5-fold on the full public set — not a true held-out result.
 
-| Finding | Value |
-|---------|-------|
+| Statistic | Value |
+|-----------|-------|
 | Label distribution | 23.8% relevant, 76.2% not relevant |
-| Opposite laterality (LT vs RT) | 98.2% not relevant |
-| Prior age <1yr relevance rate | 31.6% |
-| Prior age 10-20yr relevance rate | 15.6% |
-| Deterministic lookup pairs | 906 true, 3,907 false |
+| Opposite laterality pairs | 98.2% not relevant (n=346) |
+| Age <1yr relevance rate | 31.6% |
+| Age 10-20yr relevance rate | 15.6% |
 
 ---
 
 ## Targeted Rules (public-split validated)
 
-| Rule | Evidence (public split) | Accuracy |
-|------|------------------------|----------|
+| Rule | Evidence | Accuracy |
+|------|----------|----------|
 | Mammography vs chest X-ray → not relevant | 643 false, 3 true | 99.5% |
 | CT Chest vs CT Abdomen/Pelvis → not relevant | 319 false, 5 true | 98.5% |
-| Bilateral mammography vs unilateral mammography → relevant | 294 true, 29 false | 91.0% |
+| Bilateral mam vs unilateral mam → relevant | 294 true, 29 false | 91.0% |
 
 ---
 
 ## Stage 4: Logistic Regression
 
-**Structured features (15):** prior age normalised, body-part overlap count + Jaccard (13 regions), modality overlap count + Jaccard (6 classes), opposite/same/bilateral laterality flags, same-description flag, recency flags (≤1yr, ≤3yr, >10yr), any-body-part + any-modality + both booleans.
+**Structured features (15):** prior age normalised, body-part overlap count + Jaccard (13 regions), modality overlap count + Jaccard (6 classes), opposite/same/bilateral laterality, same-description flag, recency flags (≤1yr, ≤3yr, >10yr), any-body-part + any-modality + both booleans.
 
-**TF-IDF:** 8,000 bigrams on `"CURRENT: {desc} ||| PRIOR: {desc}"`, token `[A-Z0-9]+`, sublinear TF.
+**TF-IDF:** 8,000 bigrams on `"CURRENT: {desc} ||| PRIOR: {desc}"`, token `[A-Z0-9]+`.
 
-**Public-split 5-fold CV accuracy:** 92.7% ± 0.6%
-
-**Threshold:** 0.35 (tuned for 23.8% base rate).
+**Public-split 5-fold CV:** 92.7% ± 0.6% (NOTE: this is public-split CV, not a true held-out result)
 
 ---
 
-## Stage 5: ONNX BiomedBERT
+## Per-Category Ablation (public split, sklearn + lookup, no ONNX)
 
-Fine-tuned `microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract` on all 27,614 public labeled examples (no held-out set from public split; private split is the true test).
+Measured on all 27,614 public priors using the full pipeline minus ONNX:
 
-Training (Google Colab T4 GPU):
-- Train/val: 24,852 / 2,762 (stratified 90/10 from public split)
-- 3 epochs, batch 32, lr=2e-5, fp16
-- Epoch 1: 96.2% | Epoch 2: 97.0% | Epoch 3: 97.4% (val accuracy)
+| Category | Accuracy | n |
+|----------|----------|---|
+| age_0_1yr | 90.4% | 6,359 |
+| age_1_3yr | 95.9% | 6,493 |
+| age_3_10yr | 96.8% | 8,854 |
+| age_10plus_yr | 97.0% | 5,908 |
+| body_part_overlap | 93.1% | 6,169 |
+| no_body_part_overlap | 95.7% | 21,445 |
+| modality_overlap | 91.3% | 6,880 |
+| no_modality_overlap | 96.4% | 20,734 |
+| opposite_laterality | 96.2% | 346 |
 
-Exported to ONNX int8 using `optimum` quantisation (`avx2`, dynamic, per-tensor). Model size ~68MB. CPU batch inference ~4s per 173 priors.
+**Key insight from ablation:** The hardest cases are recent priors (age <1yr, 90.4%) with body-part overlap (93.1%) and modality overlap (91.3%). These are exactly the cases where description-only models fail — the same exam type at the same body part, but clinical context determines relevance. This is where BiomedBERT adds value.
 
-Only fires for sklearn probabilities in [0.25, 0.60]. Final prediction = average(sklearn_prob, onnx_prob) ≥ 0.40.
+---
+
+## Stage 5: ONNX BiomedBERT (97.4% val accuracy)
+
+Fine-tuned `microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract` on 27,614 public examples.
+
+- Train/val split: 24,852 / 2,762 (stratified 90/10 from public split — not a true held-out result)
+- 3 epochs, batch 32, lr=2e-5, fp16, Google Colab T4 GPU
+- Epoch 1: 96.2% | Epoch 2: 97.0% | Epoch 3: 97.4% (val accuracy on public split)
+
+**Reproducibility note:** BiomedBERT fine-tuning is not in `train.py` (requires GPU). The `--export-onnx` flag in `train.py` handles only the ONNX export step, given a pre-trained model directory. See experiments.md for the full Colab training procedure.
+
+Exported to ONNX int8 using `optimum` (`avx2`, dynamic quantisation). Model size ~68MB. Only fires for sklearn-uncertain predictions (~10% of cases). Final prediction = average(sklearn_prob, onnx_prob) ≥ `config.onnx_threshold`.
 
 ---
 
 ## What Worked
 
-1. Lookup table — zero-error on high-frequency seen pairs
-2. Laterality detection — 98.2% signal, largest single structured feature
-3. BiomedBERT fine-tuning — generalises to novel descriptions unseen by TF-IDF
-4. Background thread loading — instant server startup, no blocking
-5. Ensemble averaging — reduces variance on uncertain cases
-6. Cache with cur_date — prevents incorrect reuse across cases
+1. Lookup table — zero error on high-frequency seen pairs
+2. Laterality — 98.2% of LT vs RT pairs are not-relevant (confirmed by ablation)
+3. BiomedBERT — handles novel descriptions TF-IDF cannot generalise to
+4. Background thread loading — instant startup, no blocking
+5. Config-driven thresholds — all decision boundaries in `config.json`, not hard-coded
+6. Cache with cur_date — prevents cross-case collisions
 
 ## What Failed
 
 - Full BiomedBERT blocking startup — fixed with background thread
-- LLM (Groq) — external latency caused instability under load, removed
-- TF-IDF alone without structured features — 65% CV accuracy
+- LLM (Groq) — external latency caused instability, removed
+- TF-IDF alone — 65% CV accuracy without structured features
 - Cache key without cur_date — caused cross-case collisions (fixed)
-- Test file importing old function names — fixed, tests now match shipped code exactly
+- Hard-coded thresholds — replaced with `config.json`
+- Duplicate entrypoint in train.py — fixed to single `if __name__ == "__main__"` block
 
 ## How I Would Improve It
 
-1. GPU deployment (g4dn.xlarge) — run ONNX on all predictions, not just uncertain
-2. Per-exam-type threshold calibration using Platt scaling on public split
-3. Condition-aware lookback — chronic conditions warrant longer prior history than acute
-4. Ablation study — measure incremental gain of each stage cleanly on a true held-out split
-5. Ship ONNX dependencies in requirements.txt with pinned versions for full reproducibility
+1. **True held-out ablation** — reserve 20% of public split before training for clean error analysis
+2. **GPU deployment** — g4dn.xlarge for full BiomedBERT on all predictions
+3. **Per-exam-type threshold** — calibrate separately for mammography, cardiac, neuro using public split
+4. **Condition-aware lookback** — chronic conditions warrant longer prior history than acute
+5. **Ship BiomedBERT fine-tuning in train.py** — currently requires Colab/GPU separately
 
 ---
 
 ## Reproducibility
 
 ```bash
+# Install dependencies
 pip install -r requirements.txt
-python train.py --data relevant_priors_public.json   # rebuilds model.pkl + lookup.json
-python test_sanity.py                                 # 32 sanity checks
+
+# Rebuild model.pkl and lookup.json (also runs ablation)
+python train.py --data relevant_priors_public.json
+
+# Run 32 sanity checks
+python test_sanity.py
+
+# Start server
 uvicorn app:app --host 0.0.0.0 --port 8000
+
+# Export ONNX (requires fine-tuned BiomedBERT in ./biomedbert_priors)
+python train.py --data relevant_priors_public.json --export-onnx --bert-dir ./biomedbert_priors
 ```
 
-ONNX model built separately in Colab (see Stage 5 above). The server degrades gracefully to sklearn-only if `onnx_int8/` is absent.
+Python 3.10+. All hyperparameters in `config.json`.

@@ -1,0 +1,14 @@
+{
+    "sklearn_threshold": 0.35,
+    "onnx_threshold": 0.40,
+    "onnx_uncertainty_low": 0.25,
+    "onnx_uncertainty_high": 0.60,
+    "tfidf_max_features": 8000,
+    "tfidf_ngram_range": [1, 2],
+    "lr_C": 1.0,
+    "lr_max_iter": 1000,
+    "lr_class_weight": "balanced",
+    "lookup_min_count": 2,
+    "onnx_batch_size": 32,
+    "onnx_max_length": 128
+}

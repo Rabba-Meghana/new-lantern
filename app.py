@@ -14,6 +14,18 @@ import uvicorn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# ── Load config ───────────────────────────────────────────────────────────────
+_cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+with open(_cfg_path) as f:
+    CFG = json.load(f)
+
+SKLEARN_THRESHOLD     = CFG["sklearn_threshold"]
+ONNX_THRESHOLD        = CFG["onnx_threshold"]
+ONNX_UNCERTAINTY_LOW  = CFG["onnx_uncertainty_low"]
+ONNX_UNCERTAINTY_HIGH = CFG["onnx_uncertainty_high"]
+ONNX_BATCH_SIZE       = CFG["onnx_batch_size"]
+ONNX_MAX_LENGTH       = CFG["onnx_max_length"]
+
 app = FastAPI()
 cache = {}
 
@@ -172,9 +184,9 @@ def _onnx_predict(cur_desc: str, pri_descs: list) -> list:
     import torch
     texts = [f"Current exam: {cur_desc}. Prior exam: {pd}." for pd in pri_descs]
     all_probs = []
-    for i in range(0, len(texts), 32):
-        batch = texts[i:i+32]
-        enc = ONNX_TOKENIZER(batch, truncation=True, padding=True, max_length=128, return_tensors="pt")
+    for i in range(0, len(texts), ONNX_BATCH_SIZE):
+        batch = texts[i:i+ONNX_BATCH_SIZE]
+        enc = ONNX_TOKENIZER(batch, truncation=True, padding=True, max_length=ONNX_MAX_LENGTH, return_tensors="pt")
         with torch.no_grad():
             probs = torch.softmax(ONNX_MODEL(**enc).logits, dim=-1)[:, 1].numpy()
         all_probs.extend(probs.tolist())
@@ -232,7 +244,7 @@ def _predict_batch(current_study: dict, prior_studies: list) -> list:
         sk_probs = _sklearn_probs(cur_desc, cur_date, need_ml)
 
         if ONNX_READY:
-            uncertain     = [(j, item[0]) for j, (sk_p, item) in enumerate(zip(sk_probs, need_ml)) if 0.25 <= sk_p <= 0.60]
+            uncertain     = [(j, item[0]) for j, (sk_p, item) in enumerate(zip(sk_probs, need_ml)) if ONNX_UNCERTAINTY_LOW <= sk_p <= ONNX_UNCERTAINTY_HIGH]
             unc_descs     = [need_ml[j][1] for j, _ in uncertain]
             onnx_probs_map = {}
             if unc_descs:
@@ -246,14 +258,14 @@ def _predict_batch(current_study: dict, prior_studies: list) -> list:
             for j, (orig_i, _, _, ck) in enumerate(need_ml):
                 if j in onnx_probs_map:
                     prob = (sk_probs[j] + onnx_probs_map[j]) / 2
-                    pred = bool(prob >= 0.40)
+                    pred = bool(prob >= ONNX_THRESHOLD)
                 else:
-                    pred = bool(sk_probs[j] >= 0.35)
+                    pred = bool(sk_probs[j] >= SKLEARN_THRESHOLD)
                 final[orig_i] = pred
                 cache[ck] = pred
         else:
             for j, (orig_i, _, _, ck) in enumerate(need_ml):
-                pred = bool(sk_probs[j] >= 0.35)
+                pred = bool(sk_probs[j] >= SKLEARN_THRESHOLD)
                 final[orig_i] = pred
                 cache[ck] = pred
 
