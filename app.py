@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 cache = {}
 
-# ── sklearn (loads instantly, always available) ───────────────────────────────
+# ── sklearn ───────────────────────────────────────────────────────────────────
 _model_path = os.path.join(os.path.dirname(__file__), "model.pkl")
 with open(_model_path, "rb") as f:
     _model = pickle.load(f)
@@ -33,7 +33,7 @@ LOOKUP_TRUE  = {(a, b) for a, b in _lookup_raw["true"]}
 LOOKUP_FALSE = {(a, b) for a, b in _lookup_raw["false"]}
 logger.info("Lookup: %d true, %d false", len(LOOKUP_TRUE), len(LOOKUP_FALSE))
 
-# ── ONNX loads in background thread ──────────────────────────────────────────
+# ── ONNX in background thread ─────────────────────────────────────────────────
 ONNX_MODEL     = None
 ONNX_TOKENIZER = None
 ONNX_READY     = False
@@ -45,7 +45,7 @@ def _load_onnx_background():
         from transformers import AutoTokenizer
         _dir = os.path.join(os.path.dirname(__file__), "onnx_int8")
         ONNX_TOKENIZER = AutoTokenizer.from_pretrained(_dir)
-        ONNX_MODEL     = ORTModelForSequenceClassification.from_pretrained(
+        ONNX_MODEL = ORTModelForSequenceClassification.from_pretrained(
             _dir, file_name="model_quantized.onnx"
         )
         ONNX_READY = True
@@ -80,22 +80,22 @@ MODALITIES = {
     "mammo":      ["mammo","mammograph","mam "],
 }
 
-def _get_parts(desc):
+def _get_parts(desc: str) -> frozenset:
     d = desc.lower()
     return frozenset(p for p, kws in BODY_PARTS.items() if any(k in d for k in kws))
 
-def _get_mods(desc):
+def _get_mods(desc: str) -> frozenset:
     d = desc.lower()
     return frozenset(m for m, kws in MODALITIES.items() if any(k in d for k in kws))
 
-def _get_side(desc):
+def _get_side(desc: str) -> str:
     d = desc.upper()
     if "BILAT" in d or "BILATERAL" in d: return "bilateral"
     if (" LT" in d or "LEFT" in d) and not (" RT" in d or "RIGHT" in d): return "left"
     if (" RT" in d or "RIGHT" in d) and not (" LT" in d or "LEFT" in d): return "right"
     return "unknown"
 
-def _years_apart(d1, d2):
+def _years_apart(d1: str, d2: str) -> float:
     try:
         t1 = datetime.strptime(d1[:10], "%Y-%m-%d")
         t2 = datetime.strptime(d2[:10], "%Y-%m-%d")
@@ -103,9 +103,15 @@ def _years_apart(d1, d2):
     except (ValueError, TypeError):
         return 3.0
 
-def _safe_desc(study): return str(study.get("study_description") or "").upper()
-def _safe_date(study): return str(study.get("study_date") or "")
-def _cache_key(cd, pd, pdate): return hashlib.md5(f"{cd}|{pd}|{pdate}".encode()).hexdigest()
+def _safe_desc(study: dict) -> str:
+    return str(study.get("study_description") or "").upper()
+
+def _safe_date(study: dict) -> str:
+    return str(study.get("study_date") or "")
+
+# BUG FIX: include cur_date in cache key to prevent cross-case cache collisions
+def _cache_key(cur_desc: str, cur_date: str, pri_desc: str, pri_date: str) -> str:
+    return hashlib.md5(f"{cur_desc}|{cur_date}|{pri_desc}|{pri_date}".encode()).hexdigest()
 
 def _build_features(cur_desc, cur_date, pri_desc, pri_date):
     cp=_get_parts(cur_desc); pp=_get_parts(pri_desc)
@@ -120,23 +126,49 @@ def _build_features(cur_desc, cur_date, pri_desc, pri_date):
             int(years<=1), int(years<=3), int(years>10),
             int(po>0), int(mo>0), int(po>0 and mo>0)]
 
-def _is_mam(d):     dl=d.lower(); return any(k in dl for k in ["mam ","mammo","mammograph","breast"])
-def _is_cxr(d):     dl=d.lower(); return any(k in dl for k in ["chest","cxr","frontal","pa/lat","thorax"]) and not _is_mam(d)
-def _is_ctchest(d): dl=d.lower(); return "ct " in dl and "chest" in dl and "abd" not in dl and "pelv" not in dl
-def _is_ctabd(d):   dl=d.lower(); return "ct " in dl and any(k in dl for k in ["abdomen","pelvis","abd/pel","abd pel"])
-def _is_mam_bi(d):  dl=d.lower(); return _is_mam(d) and any(k in dl for k in ["bilat","bilateral"," bi ","screen","3d"])
-def _is_mam_uni(d): dl=d.lower(); return _is_mam(d) and not any(k in dl for k in ["bilat","bilateral"," bi "]) and any(k in dl for k in [" lt"," rt","left","right"])
+# ── Targeted rules ────────────────────────────────────────────────────────────
+# Consistent naming: full descriptive names used in both app.py and test_sanity.py
+def is_mammography(desc: str) -> bool:
+    d = desc.lower()
+    return any(k in d for k in ["mam ","mammo","mammograph","breast"])
 
-def _targeted_rule(cur_desc, pri_desc):
-    if _is_mam(cur_desc) and _is_cxr(pri_desc): return False
-    if _is_cxr(cur_desc) and _is_mam(pri_desc): return False
-    if _is_ctchest(cur_desc) and _is_ctabd(pri_desc): return False
-    if _is_ctabd(cur_desc) and _is_ctchest(pri_desc): return False
-    if _is_mam_bi(cur_desc) and _is_mam_uni(pri_desc): return True
-    if _is_mam_uni(cur_desc) and _is_mam_bi(pri_desc): return True
+def is_chest_xray(desc: str) -> bool:
+    d = desc.lower()
+    return any(k in d for k in ["chest","cxr","frontal","pa/lat","thorax"]) and not is_mammography(desc)
+
+def is_ct_chest(desc: str) -> bool:
+    d = desc.lower()
+    return "ct " in d and "chest" in d and "abd" not in d and "pelv" not in d
+
+def is_ct_abdomen(desc: str) -> bool:
+    d = desc.lower()
+    return "ct " in d and any(k in d for k in ["abdomen","pelvis","abd/pel","abd pel"])
+
+def is_mam_bilateral(desc: str) -> bool:
+    d = desc.lower()
+    return is_mammography(desc) and any(k in d for k in ["bilat","bilateral"," bi ","screen","3d"])
+
+def is_mam_unilateral(desc: str) -> bool:
+    d = desc.lower()
+    return (is_mammography(desc)
+            and not any(k in d for k in ["bilat","bilateral"," bi "])
+            and any(k in d for k in [" lt"," rt","left","right"]))
+
+def _targeted_rule(cur_desc: str, pri_desc: str):
+    """Returns True, False, or None (ML decides). Each rule is data-validated."""
+    # Mammography vs chest X-ray: 643 false, 3 true on public split
+    if is_mammography(cur_desc) and is_chest_xray(pri_desc): return False
+    if is_chest_xray(cur_desc) and is_mammography(pri_desc): return False
+    # CT Chest vs CT Abdomen: 319 false, 5 true on public split
+    if is_ct_chest(cur_desc) and is_ct_abdomen(pri_desc): return False
+    if is_ct_abdomen(cur_desc) and is_ct_chest(pri_desc): return False
+    # Bilateral mam vs unilateral mam: 294 true, 29 false on public split
+    if is_mam_bilateral(cur_desc) and is_mam_unilateral(pri_desc): return True
+    if is_mam_unilateral(cur_desc) and is_mam_bilateral(pri_desc): return True
     return None
 
-def _onnx_predict(cur_desc, pri_descs):
+# ── ONNX inference ────────────────────────────────────────────────────────────
+def _onnx_predict(cur_desc: str, pri_descs: list) -> list:
     import torch
     texts = [f"Current exam: {cur_desc}. Prior exam: {pd}." for pd in pri_descs]
     all_probs = []
@@ -148,18 +180,29 @@ def _onnx_predict(cur_desc, pri_descs):
         all_probs.extend(probs.tolist())
     return all_probs
 
-def _sklearn_probs(cur_desc, cur_date, items):
+# ── sklearn inference ─────────────────────────────────────────────────────────
+def _sklearn_probs(cur_desc: str, cur_date: str, items: list) -> list:
     texts = [f"CURRENT: {cur_desc} ||| PRIOR: {pd}" for _, pd, _, _ in items]
     metas = [_build_features(cur_desc, cur_date, pd, pdate) for _, pd, pdate, _ in items]
     try:
-        X = sp.hstack([VECTORIZER.transform(texts), sp.csr_matrix(np.array(metas, dtype=float))])
+        X = sp.hstack([VECTORIZER.transform(texts),
+                       sp.csr_matrix(np.array(metas, dtype=float))])
         return CLF.predict_proba(X)[:, 1].tolist()
     except Exception as e:
         logger.error("sklearn error: %s", e)
         cp = _get_parts(cur_desc)
         return [0.8 if cp & _get_parts(pd) else 0.2 for _, pd, _, _ in items]
 
-def _predict_batch(current_study, prior_studies):
+# ── Core prediction pipeline ──────────────────────────────────────────────────
+def _predict_batch(current_study: dict, prior_studies: list) -> list:
+    """
+    5-stage pipeline:
+      1. Cache (keyed on cur_desc + cur_date + pri_desc + pri_date)
+      2. Empirical lookup table
+      3. Targeted clinical rules
+      4. sklearn logistic regression
+      5. ONNX BiomedBERT ensemble (uncertain sklearn predictions only)
+    """
     cur_desc = _safe_desc(current_study)
     cur_date = _safe_date(current_study)
     final    = [None] * len(prior_studies)
@@ -168,7 +211,8 @@ def _predict_batch(current_study, prior_studies):
     for i, prior in enumerate(prior_studies):
         pri_desc = _safe_desc(prior)
         pri_date = _safe_date(prior)
-        ck = _cache_key(cur_desc, pri_desc, pri_date)
+        # FIX: cache key now includes cur_date to prevent cross-case collisions
+        ck = _cache_key(cur_desc, cur_date, pri_desc, pri_date)
 
         if ck in cache:
             final[i] = cache[ck]; continue
@@ -186,37 +230,29 @@ def _predict_batch(current_study, prior_studies):
         need_ml.append((i, pri_desc, pri_date, ck))
 
     if need_ml:
-        # Get sklearn probabilities for all
         sk_probs = _sklearn_probs(cur_desc, cur_date, need_ml)
 
         if ONNX_READY:
-            # Only send uncertain cases (0.25-0.60) to ONNX
-            uncertain = [(j, idx, item) for j, (sk_p, item) in enumerate(zip(sk_probs, need_ml))
-                        if 0.25 <= sk_p <= 0.60
-                        for idx in [item[0]]]
-            uncertain_descs = [need_ml[j][1] for j, _, _ in uncertain]
-
-            if uncertain_descs:
+            uncertain     = [(j, item[0]) for j, (sk_p, item) in enumerate(zip(sk_probs, need_ml)) if 0.25 <= sk_p <= 0.60]
+            unc_descs     = [need_ml[j][1] for j, _ in uncertain]
+            onnx_probs_map = {}
+            if unc_descs:
                 try:
-                    onnx_probs = _onnx_predict(cur_desc, uncertain_descs)
-                    for k, (j, orig_i, _) in enumerate(uncertain):
-                        # Ensemble: average sklearn + onnx
-                        final_prob = (sk_probs[j] + onnx_probs[k]) / 2
-                        pred = bool(final_prob >= 0.40)
-                        final[orig_i] = pred
-                        cache[need_ml[j][3]] = pred
+                    onnx_probs = _onnx_predict(cur_desc, unc_descs)
+                    for k, (j, _) in enumerate(uncertain):
+                        onnx_probs_map[j] = onnx_probs[k]
                 except Exception as e:
                     logger.error("ONNX inference failed: %s", e)
-                    uncertain = []  # fall through to sklearn
 
-            # Non-uncertain: use sklearn directly
             for j, (orig_i, _, _, ck) in enumerate(need_ml):
-                if final[orig_i] is None:
+                if j in onnx_probs_map:
+                    prob = (sk_probs[j] + onnx_probs_map[j]) / 2
+                    pred = bool(prob >= 0.40)
+                else:
                     pred = bool(sk_probs[j] >= 0.35)
-                    final[orig_i] = pred
-                    cache[ck] = pred
+                final[orig_i] = pred
+                cache[ck] = pred
         else:
-            # ONNX not ready yet — use sklearn for everything
             for j, (orig_i, _, _, ck) in enumerate(need_ml):
                 pred = bool(sk_probs[j] >= 0.35)
                 final[orig_i] = pred
@@ -224,6 +260,7 @@ def _predict_batch(current_study, prior_studies):
 
     return [bool(r) if r is not None else False for r in final]
 
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.post("/predict")
 async def predict(request: Request):
     try:
@@ -235,7 +272,7 @@ async def predict(request: Request):
     if not isinstance(cases, list):
         raise HTTPException(status_code=400, detail="'cases' must be a list")
 
-    logger.info("Request: %d cases | ONNX ready: %s", len(cases), ONNX_READY)
+    logger.info("Request: %d cases | ONNX=%s", len(cases), ONNX_READY)
     predictions = []
 
     for case in cases:
