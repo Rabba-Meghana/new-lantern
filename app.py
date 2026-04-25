@@ -11,6 +11,12 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -169,7 +175,6 @@ def _targeted_rule(cur_desc: str, pri_desc: str):
 
 # ── ONNX inference ────────────────────────────────────────────────────────────
 def _onnx_predict(cur_desc: str, pri_descs: list) -> list:
-    import torch
     texts = [f"Current exam: {cur_desc}. Prior exam: {pd}." for pd in pri_descs]
     all_probs = []
     for i in range(0, len(texts), 32):

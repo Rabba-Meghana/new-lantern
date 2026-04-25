@@ -175,3 +175,50 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def export_onnx(model_dir: str = "./biomedbert_priors",
+                output_dir: str = "./onnx_int8"):
+    """
+    Export fine-tuned BiomedBERT to quantised ONNX.
+    Requires: pip install optimum[onnxruntime] torch transformers
+
+    Usage (after training):
+        python train.py --data relevant_priors_public.json --export-onnx
+
+    Or in Google Colab after trainer.train():
+        from train import export_onnx
+        export_onnx("./biomedbert_priors", "./onnx_int8")
+    """
+    from optimum.onnxruntime import ORTModelForSequenceClassification, ORTQuantizer
+    from optimum.onnxruntime.configuration import AutoQuantizationConfig
+    from transformers import AutoTokenizer
+    import os
+
+    onnx_dir = output_dir + "_fp32"
+    print(f"Exporting to ONNX: {onnx_dir}")
+    ort_model = ORTModelForSequenceClassification.from_pretrained(model_dir, export=True)
+    ort_model.save_pretrained(onnx_dir)
+    AutoTokenizer.from_pretrained(model_dir).save_pretrained(onnx_dir)
+
+    print(f"Quantising to int8: {output_dir}")
+    quantizer = ORTQuantizer.from_pretrained(onnx_dir)
+    qconfig = AutoQuantizationConfig.avx2(is_static=False, per_channel=False)
+    quantizer.quantize(save_dir=output_dir, quantization_config=qconfig)
+    AutoTokenizer.from_pretrained(model_dir).save_pretrained(output_dir)
+    print(f"Done. ONNX model saved to {output_dir}/")
+
+
+if __name__ == "__main__":
+    import argparse as _ap
+    _p = _ap.ArgumentParser()
+    _p.add_argument("--data", required=True)
+    _p.add_argument("--model-out", default="model.pkl")
+    _p.add_argument("--lookup-out", default="lookup.json")
+    _p.add_argument("--cv-folds", type=int, default=5)
+    _p.add_argument("--export-onnx", action="store_true",
+                    help="Also export fine-tuned BiomedBERT to ONNX int8 (requires optimum)")
+    _args = _p.parse_args()
+    main()
+    if _args.export_onnx:
+        export_onnx()
