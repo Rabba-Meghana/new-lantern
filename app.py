@@ -14,29 +14,7 @@ app = FastAPI()
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 cache = {}
 
-# ─── Load BiomedBERT model (97.2% accuracy) ───────────────────────────────────
-_bert_loaded = False
-BERT_MODEL = None
-BERT_TOKENIZER = None
-
-def load_bert():
-    global _bert_loaded, BERT_MODEL, BERT_TOKENIZER
-    if _bert_loaded:
-        return
-    try:
-        import torch
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification
-        _model_dir = os.path.join(os.path.dirname(__file__), "best_model")
-        BERT_TOKENIZER = AutoTokenizer.from_pretrained(_model_dir)
-        BERT_MODEL = AutoModelForSequenceClassification.from_pretrained(_model_dir)
-        BERT_MODEL.eval()
-        _bert_loaded = True
-        print("BiomedBERT loaded!")
-    except Exception as e:
-        print(f"BiomedBERT load failed: {e}, falling back to sklearn")
-        _bert_loaded = False
-
-# ─── Load sklearn fallback ────────────────────────────────────────────────────
+# ─── Load sklearn model ───────────────────────────────────────────────────────
 _model_path = os.path.join(os.path.dirname(__file__), "model.pkl")
 with open(_model_path, 'rb') as f:
     _model = pickle.load(f)
@@ -113,8 +91,8 @@ def build_features(cur_desc, cur_date, pri_desc, pri_date):
     mod_overlap  = len(cur_mods & pri_mods)
     part_union   = len(cur_parts | pri_parts) or 1
     mod_union    = len(cur_mods | pri_mods) or 1
-    opposite_side = int((cur_side=='left' and pri_side=='right') or (cur_side=='right' and pri_side=='left'))
-    same_side     = int(cur_side == pri_side and cur_side not in ('unknown',))
+    opposite_side  = int((cur_side=='left' and pri_side=='right') or (cur_side=='right' and pri_side=='left'))
+    same_side      = int(cur_side == pri_side and cur_side not in ('unknown',))
     both_bilateral = int(cur_side=='bilateral' and pri_side=='bilateral')
     return [
         years/20.0, part_overlap, part_overlap/part_union,
@@ -124,28 +102,6 @@ def build_features(cur_desc, cur_date, pri_desc, pri_date):
         int(part_overlap>0), int(mod_overlap>0), int(part_overlap>0 and mod_overlap>0),
     ]
 
-# ─── BiomedBERT batch prediction ──────────────────────────────────────────────
-def bert_predict_batch(current_study, prior_studies, threshold=0.35):
-    import torch
-    cur_desc = current_study.get('study_description', '').upper()
-    cur_date = current_study.get('study_date', '')
-    texts = [
-        f"Current exam: {cur_desc}. Prior exam: {p.get('study_description','').upper()}."
-        for p in prior_studies
-    ]
-    # Process in batches of 32
-    all_probs = []
-    batch_size = 32
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        enc = BERT_TOKENIZER(batch, truncation=True, padding=True, max_length=128, return_tensors='pt')
-        with torch.no_grad():
-            logits = BERT_MODEL(**enc).logits
-            probs = torch.softmax(logits, dim=-1)[:, 1].numpy()
-        all_probs.extend(probs)
-    return [bool(p >= threshold) for p in all_probs]
-
-# ─── Sklearn fallback batch prediction ───────────────────────────────────────
 def sklearn_predict_batch(current_study, prior_studies):
     cur_desc = current_study.get('study_description', '').upper()
     cur_date = current_study.get('study_date', '')
@@ -208,14 +164,7 @@ def predict_relevance_batch(current_study, prior_studies):
             need_ml.append(prior); need_ml_idx.append(i)
 
     if need_ml:
-        # Use BiomedBERT if loaded, else sklearn
-        if _bert_loaded:
-            ml_preds = bert_predict_batch(current_study, need_ml)
-            # Get sklearn probs for uncertainty routing to LLM
-            _, probs = sklearn_predict_batch(current_study, need_ml)
-        else:
-            ml_preds, probs = sklearn_predict_batch(current_study, need_ml)
-
+        ml_preds, probs = sklearn_predict_batch(current_study, need_ml)
         uncertain_idx, uncertain_priors = [], []
         for j, (orig_i, prior, prob) in enumerate(zip(need_ml_idx, need_ml, probs)):
             if 0.25 <= prob <= 0.55:
@@ -233,11 +182,7 @@ def predict_relevance_batch(current_study, prior_studies):
 
     return [r if r is not None else True for r in final]
 
-# ─── Startup ──────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup():
-    load_bert()
-
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.post("/predict")
 async def predict(request: Request):
     body = await request.json()
@@ -253,7 +198,7 @@ async def predict(request: Request):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "bert": _bert_loaded}
+    return {"status": "ok", "model": "sklearn+lookup+llm"}
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
