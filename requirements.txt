@@ -3,3 +3,5 @@ uvicorn==0.46.0
 scikit-learn==1.6.1
 numpy==2.2.5
 scipy==1.15.3
+onnxruntime==1.21.0
+optimum==1.24.0
