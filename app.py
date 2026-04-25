@@ -10,6 +10,7 @@ import hashlib
 import pickle
 import logging
 import threading
+from collections import OrderedDict
 import numpy as np
 import scipy.sparse as sp
 from fastapi import FastAPI, Request, HTTPException
@@ -24,8 +25,29 @@ from features import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-app   = FastAPI()
-cache = {}
+app = FastAPI()
+
+# Thread-safe LRU cache (max 50,000 entries) to prevent unbounded memory growth
+# in long-running production deployments.
+_CACHE_MAX = 50_000
+_cache: OrderedDict = OrderedDict()
+_cache_lock = threading.Lock()
+
+def _cache_get(key: str):
+    with _cache_lock:
+        if key in _cache:
+            _cache.move_to_end(key)
+            return _cache[key]
+    return None
+
+def _cache_set(key: str, value: bool):
+    with _cache_lock:
+        if key in _cache:
+            _cache.move_to_end(key)
+        else:
+            if len(_cache) >= _CACHE_MAX:
+                _cache.popitem(last=False)  # evict oldest
+        _cache[key] = value
 
 # Thresholds from config (no hard-coded values)
 SKLEARN_THRESHOLD     = CFG["sklearn_threshold"]
@@ -129,18 +151,19 @@ def _predict_batch(current_study: dict, prior_studies: list) -> list:
         pri_date = safe_date(prior)
         ck       = _cache_key(cur_desc, cur_date, pri_desc, pri_date)
 
-        if ck in cache:
-            final[i] = cache[ck]; continue
+        cached = _cache_get(ck)
+        if cached is not None:
+            final[i] = cached; continue
 
         key = (cur_desc, pri_desc)
         if key in LOOKUP_TRUE:
-            final[i] = True;  cache[ck] = True;  continue
+            final[i] = True;  _cache_set(ck, True);  continue
         if key in LOOKUP_FALSE:
-            final[i] = False; cache[ck] = False; continue
+            final[i] = False; _cache_set(ck, False); continue
 
         rule = targeted_rule(cur_desc, pri_desc)
         if rule is not None:
-            final[i] = rule; cache[ck] = rule; continue
+            final[i] = rule; _cache_set(ck, rule); continue
 
         need_ml.append((i, pri_desc, pri_date, ck))
 
@@ -170,7 +193,7 @@ def _predict_batch(current_study: dict, prior_studies: list) -> list:
             else:
                 pred = bool(sk_probs[j] >= SKLEARN_THRESHOLD)
             final[orig_i] = pred
-            cache[ck]     = pred
+            _cache_set(ck, pred)
 
     return [bool(r) if r is not None else False for r in final]
 
@@ -215,7 +238,7 @@ def health():
         "status":     "ok",
         "onnx_ready": ONNX_READY,
         "model":      "sklearn+onnx_ensemble" if ONNX_READY else "sklearn",
-        "cache_size": len(cache),
+        "cache_size": len(_cache),
     }
 
 if __name__ == "__main__":

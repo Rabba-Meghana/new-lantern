@@ -29,7 +29,7 @@ import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score, GroupShuffleSplit
 
 from features import (
     CFG, build_features, get_parts, get_mods, get_side, years_apart,
@@ -51,7 +51,7 @@ def build_dataset(data: dict):
         for t in data["truth"]
     }
 
-    texts, metas, labels = [], [], []
+    texts, metas, labels, groups = [], [], [], []
     pair_stats = defaultdict(lambda: {"true": 0, "false": 0})
 
     for case in cases:
@@ -70,6 +70,7 @@ def build_dataset(data: dict):
             texts.append(f"CURRENT: {cur_desc} ||| PRIOR: {pri_desc}")
             metas.append(build_features(cur_desc, cur_date, pri_desc, pri_date))
             labels.append(1 if label else 0)
+            groups.append(case_id)  # group by case to prevent leakage across splits
 
             key = (cur_desc, pri_desc)
             if label:
@@ -77,7 +78,7 @@ def build_dataset(data: dict):
             else:
                 pair_stats[key]["false"] += 1
 
-    return texts, metas, labels, pair_stats, cases, truth_map
+    return texts, metas, labels, groups, pair_stats, cases, truth_map
 
 
 def build_lookup(pair_stats: dict, min_count: int):
@@ -155,7 +156,7 @@ def main(args):
     with open(args.data) as f:
         data = json.load(f)
 
-    texts, metas, labels, pair_stats, cases, truth_map = build_dataset(data)
+    texts, metas, labels, groups, pair_stats, cases, truth_map = build_dataset(data)
     print(f"Dataset: {len(texts)} samples  positive={sum(labels)/len(labels)*100:.1f}%")
 
     # ── Lookup tables ──────────────────────────────────────────────────────────
@@ -185,12 +186,14 @@ def main(args):
         random_state=args.seed,
     )
 
-    # Explicit StratifiedKFold with shuffle and seed for full reproducibility
-    cv = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
-    print(f"Running {args.cv_folds}-fold StratifiedKFold CV (seed={args.seed}) ...")
-    cv_scores = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
-    print(f"CV accuracy (public split only): {cv_scores.mean()*100:.2f}% +/- {cv_scores.std()*100:.2f}%")
-    print("NOTE: this is measured on the public split — private split is unseen")
+    # GroupShuffleSplit by case_id prevents same-case priors leaking across train/val splits
+    # This gives a more honest estimate of generalisation to unseen cases
+    groups_arr = np.array(groups)
+    cv = GroupShuffleSplit(n_splits=args.cv_folds, test_size=0.1, random_state=args.seed)
+    print(f"Running {args.cv_folds}-fold GroupShuffleSplit CV by case_id (seed={args.seed}) ...")
+    cv_scores = cross_val_score(clf, X, y, cv=cv, groups=groups_arr, scoring="accuracy")
+    print(f"CV accuracy (grouped by case, public split only): {cv_scores.mean()*100:.2f}% +/- {cv_scores.std()*100:.2f}%")
+    print("NOTE: grouped CV prevents same-case leakage. Private split is still unseen.")
 
     clf.fit(X, y)
     print(f"Train accuracy: {accuracy_score(y, clf.predict(X))*100:.2f}%")

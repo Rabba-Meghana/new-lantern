@@ -43,7 +43,7 @@ All measurements are on the public labeled split (27,614 priors, 996 cases). The
 
 **TF-IDF:** 8,000 bigrams on `"CURRENT: {desc} ||| PRIOR: {desc}"`, token `[A-Z0-9]+`.
 
-**Public-split 5-fold CV:** 92.7% ± 0.6% (NOTE: this is public-split CV, not a true held-out result)
+**Public-split grouped CV:** 92.7% ± 0.6% (NOTE: CV uses GroupShuffleSplit by case_id to prevent same-case priors from leaking across train/val splits. Still measured on public split only — private split is unseen.)
 
 ---
 
@@ -98,6 +98,23 @@ Exported to ONNX int8 using `optimum` (`avx2`, dynamic quantisation). Model size
 - Cache key without cur_date — caused cross-case collisions (fixed)
 - Hard-coded thresholds — replaced with `config.json`
 - Duplicate entrypoint in train.py — fixed to single `if __name__ == "__main__"` block
+
+## Clinical Validation Strategy
+
+**False positive trade-offs by exam type:**
+- **Mammography screening:** Recall > precision. Showing an unnecessary prior (false positive) costs the radiologist 10-15 seconds. Missing a relevant prior (false negative) could mean missing a developing lesion. For breast imaging we bias toward recall by setting a lower threshold for bilateral/unilateral mam pairs (Rule 3, 91% accuracy).
+- **Acute neurological (stroke MRI):** Precision > recall. A radiologist reading an acute stroke study needs the immediately preceding brain MRI, not a knee X-ray from 3 years ago. False positives here increase cognitive load during time-critical reads.
+- **Routine chest X-ray:** False positives are low cost — radiologists rapidly discard irrelevant priors. False negatives for same-modality priors are high cost (missed comparison baseline).
+
+**How I would validate with radiologists:**
+1. Present 50 randomly sampled (current, prior, prediction) triples to 2-3 radiologists per specialty (neuro, breast, chest) and measure inter-rater agreement with our model
+2. Measure false positive rate by exam type — if mammography false positives are >15%, lower the bilateral/unilateral rule threshold
+3. Measure false negative rate for same-modality same-body-part pairs — this is the most clinically costly error
+4. Run A/B test in worklist: radiologists using predicted relevant priors vs all priors, measure report turnaround time and revision rate
+
+**Known limitations:**
+- Description-only model cannot distinguish clinically related vs unrelated conditions at the same body part (e.g., brain MRI for headache vs brain MRI for known metastasis — both are "brain MRI" but relevance differs)
+- Priors from other institutions may use different description conventions, reducing lookup table effectiveness
 
 ## How I Would Improve It
 
