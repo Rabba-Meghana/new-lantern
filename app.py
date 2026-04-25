@@ -7,10 +7,14 @@ import scipy.sparse as sp
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from groq import Groq
 import uvicorn
 
 app = FastAPI()
 cache = {}
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+client = Groq(api_key=GROQ_API_KEY)
 
 _model_path = os.path.join(os.path.dirname(__file__), "model.pkl")
 with open(_model_path, 'rb') as f:
@@ -101,6 +105,30 @@ def make_cache_key(current_study, prior_study):
     key = f"{current_study.get('study_description','')}|{prior_study.get('study_description','')}|{prior_study.get('study_date','')}"
     return hashlib.md5(key.encode()).hexdigest()
 
+def predict_with_llm(current_study, priors):
+    if not priors:
+        return []
+    try:
+        priors_text = "\n".join([f"{j+1}. {p.get('study_description','N/A')} | {p.get('study_date','N/A')}" for j,p in enumerate(priors)])
+        prompt = f"CURRENT: {current_study.get('study_description','N/A')} | {current_study.get('study_date','N/A')}\nPRIORS:\n{priors_text}\nReturn JSON array of {len(priors)} booleans only."
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a radiology expert. Return ONLY a JSON boolean array, no explanation."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+            max_tokens=256,
+            timeout=10,  # 10 second timeout
+        )
+        raw = response.choices[0].message.content.strip()
+        preds = json.loads(raw[raw.index('['):raw.rindex(']')+1])
+        while len(preds) < len(priors): preds.append(True)
+        return [bool(p) for p in preds[:len(priors)]]
+    except Exception as e:
+        print(f"LLM failed: {e}, using sklearn fallback")
+        return None  # Signal to use sklearn result
+
 def predict_relevance_batch(current_study, prior_studies):
     if not prior_studies:
         return []
@@ -133,10 +161,24 @@ def predict_relevance_batch(current_study, prior_studies):
         X_meta  = sp.csr_matrix(np.array(metas))
         X       = sp.hstack([X_tfidf, X_meta])
         probs   = CLF.predict_proba(X)[:, 1]
-        preds   = [bool(p >= 0.35) for p in probs]
-        for j, (orig_i, prior) in enumerate(zip(need_ml_idx, need_ml)):
-            final[orig_i] = preds[j]
-            cache[make_cache_key(current_study, prior)] = preds[j]
+        ml_preds = [bool(p >= 0.35) for p in probs]
+
+        # Only use LLM for very uncertain cases (0.3-0.5 range)
+        uncertain_idx, uncertain_priors = [], []
+        for j, (orig_i, prior, prob) in enumerate(zip(need_ml_idx, need_ml, probs)):
+            if 0.30 <= prob <= 0.50:
+                uncertain_idx.append((j, orig_i))
+                uncertain_priors.append(prior)
+            else:
+                final[orig_i] = ml_preds[j]
+                cache[make_cache_key(current_study, prior)] = ml_preds[j]
+
+        if uncertain_priors:
+            llm_preds = predict_with_llm(current_study, uncertain_priors)
+            for k, (j, orig_i) in enumerate(uncertain_idx):
+                pred = llm_preds[k] if llm_preds else ml_preds[j]
+                final[orig_i] = pred
+                cache[make_cache_key(current_study, need_ml[j])] = pred
 
     return [r if r is not None else True for r in final]
 
@@ -163,7 +205,7 @@ async def predict(request: Request):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "sklearn+lookup"}
+    return {"status": "ok", "model": "sklearn+lookup+llm"}
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
