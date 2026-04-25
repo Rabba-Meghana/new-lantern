@@ -11,12 +11,6 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
 
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -115,7 +109,7 @@ def _safe_desc(study: dict) -> str:
 def _safe_date(study: dict) -> str:
     return str(study.get("study_date") or "")
 
-# BUG FIX: include cur_date in cache key to prevent cross-case cache collisions
+# Cache key includes cur_date to prevent collisions across cases sharing the same prior description
 def _cache_key(cur_desc: str, cur_date: str, pri_desc: str, pri_date: str) -> str:
     return hashlib.md5(f"{cur_desc}|{cur_date}|{pri_desc}|{pri_date}".encode()).hexdigest()
 
@@ -175,6 +169,7 @@ def _targeted_rule(cur_desc: str, pri_desc: str):
 
 # ── ONNX inference ────────────────────────────────────────────────────────────
 def _onnx_predict(cur_desc: str, pri_descs: list) -> list:
+    import torch
     texts = [f"Current exam: {cur_desc}. Prior exam: {pd}." for pd in pri_descs]
     all_probs = []
     for i in range(0, len(texts), 32):
@@ -216,7 +211,6 @@ def _predict_batch(current_study: dict, prior_studies: list) -> list:
     for i, prior in enumerate(prior_studies):
         pri_desc = _safe_desc(prior)
         pri_date = _safe_date(prior)
-        # FIX: cache key now includes cur_date to prevent cross-case collisions
         ck = _cache_key(cur_desc, cur_date, pri_desc, pri_date)
 
         if ck in cache:
