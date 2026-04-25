@@ -7,28 +7,23 @@ import scipy.sparse as sp
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from groq import Groq
 import uvicorn
 
 app = FastAPI()
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 cache = {}
 
-# ─── Load sklearn model ───────────────────────────────────────────────────────
 _model_path = os.path.join(os.path.dirname(__file__), "model.pkl")
 with open(_model_path, 'rb') as f:
     _model = pickle.load(f)
 VECTORIZER = _model['vectorizer']
 CLF = _model['clf']
 
-# ─── Load empirical lookup table ──────────────────────────────────────────────
 _lookup_path = os.path.join(os.path.dirname(__file__), "lookup.json")
 with open(_lookup_path) as f:
     _lookup_raw = json.load(f)
 LOOKUP_TRUE  = {(a, b) for a, b in _lookup_raw["true"]}
 LOOKUP_FALSE = {(a, b) for a, b in _lookup_raw["false"]}
 
-# ─── Feature extraction ───────────────────────────────────────────────────────
 BODY_PARTS = {
     "brain":          ["brain", "head", "cranial", "cranium", "intracranial", "cerebr", "neuro", "skull", "orbit", "sella", "pituitary"],
     "spine_cervical": ["cervical", "c-spine", "c spine"],
@@ -102,47 +97,10 @@ def build_features(cur_desc, cur_date, pri_desc, pri_date):
         int(part_overlap>0), int(mod_overlap>0), int(part_overlap>0 and mod_overlap>0),
     ]
 
-def sklearn_predict_batch(current_study, prior_studies):
-    cur_desc = current_study.get('study_description', '').upper()
-    cur_date = current_study.get('study_date', '')
-    texts, metas = [], []
-    for p in prior_studies:
-        pri_desc = p.get('study_description','').upper()
-        texts.append(f"CURRENT: {cur_desc} ||| PRIOR: {pri_desc}")
-        metas.append(build_features(cur_desc, cur_date, pri_desc, p.get('study_date','')))
-    X_tfidf = VECTORIZER.transform(texts)
-    X_meta  = sp.csr_matrix(np.array(metas))
-    X       = sp.hstack([X_tfidf, X_meta])
-    probs   = CLF.predict_proba(X)[:, 1]
-    return [bool(p >= 0.35) for p in probs], probs
-
-# ─── LLM for uncertain cases ──────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an expert radiologist. Determine if prior exams are relevant for a radiologist reading a current exam.
-Return ONLY a JSON boolean array. No explanation. No markdown."""
-
 def make_cache_key(current_study, prior_study):
     key = f"{current_study.get('study_description','')}|{prior_study.get('study_description','')}|{prior_study.get('study_date','')}"
     return hashlib.md5(key.encode()).hexdigest()
 
-def predict_with_llm(current_study, priors):
-    if not priors:
-        return []
-    priors_text = "\n".join([f"{j+1}. {p.get('study_description','N/A')} | {p.get('study_date','N/A')}" for j,p in enumerate(priors)])
-    prompt = f"CURRENT: {current_study.get('study_description','N/A')} | {current_study.get('study_date','N/A')}\nPRIORS:\n{priors_text}\nReturn JSON array of {len(priors)} booleans."
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":prompt}],
-        temperature=0, max_tokens=512,
-    )
-    raw = response.choices[0].message.content.strip()
-    try:
-        preds = json.loads(raw[raw.index('['):raw.rindex(']')+1])
-        while len(preds) < len(priors): preds.append(True)
-        return [bool(p) for p in preds[:len(priors)]]
-    except:
-        return [True] * len(priors)
-
-# ─── Main pipeline ────────────────────────────────────────────────────────────
 def predict_relevance_batch(current_study, prior_studies):
     if not prior_studies:
         return []
@@ -164,41 +122,48 @@ def predict_relevance_batch(current_study, prior_studies):
             need_ml.append(prior); need_ml_idx.append(i)
 
     if need_ml:
-        ml_preds, probs = sklearn_predict_batch(current_study, need_ml)
-        uncertain_idx, uncertain_priors = [], []
-        for j, (orig_i, prior, prob) in enumerate(zip(need_ml_idx, need_ml, probs)):
-            if 0.25 <= prob <= 0.55:
-                uncertain_idx.append((j, orig_i))
-                uncertain_priors.append(prior)
-            else:
-                final[orig_i] = ml_preds[j]
-                cache[make_cache_key(current_study, prior)] = ml_preds[j]
-
-        if uncertain_priors:
-            llm_preds = predict_with_llm(current_study, uncertain_priors)
-            for (j, orig_i), pred, prior in zip(uncertain_idx, llm_preds, uncertain_priors):
-                final[orig_i] = pred
-                cache[make_cache_key(current_study, prior)] = pred
+        cur_desc = current_study.get('study_description', '').upper()
+        cur_date = current_study.get('study_date', '')
+        texts, metas = [], []
+        for p in need_ml:
+            pri_desc = p.get('study_description','').upper()
+            texts.append(f"CURRENT: {cur_desc} ||| PRIOR: {pri_desc}")
+            metas.append(build_features(cur_desc, cur_date, pri_desc, p.get('study_date','')))
+        X_tfidf = VECTORIZER.transform(texts)
+        X_meta  = sp.csr_matrix(np.array(metas))
+        X       = sp.hstack([X_tfidf, X_meta])
+        probs   = CLF.predict_proba(X)[:, 1]
+        preds   = [bool(p >= 0.35) for p in probs]
+        for j, (orig_i, prior) in enumerate(zip(need_ml_idx, need_ml)):
+            final[orig_i] = preds[j]
+            cache[make_cache_key(current_study, prior)] = preds[j]
 
     return [r if r is not None else True for r in final]
 
-# ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.post("/predict")
 async def predict(request: Request):
-    body = await request.json()
-    predictions = []
-    for case in body.get("cases", []):
-        case_id = case["case_id"]
-        current_study = case["current_study"]
-        prior_studies = case.get("prior_studies", [])
-        relevances = predict_relevance_batch(current_study, prior_studies)
-        for prior, is_relevant in zip(prior_studies, relevances):
-            predictions.append({"case_id": case_id, "study_id": prior["study_id"], "predicted_is_relevant": is_relevant})
-    return JSONResponse(content={"predictions": predictions})
+    try:
+        body = await request.json()
+        predictions = []
+        for case in body.get("cases", []):
+            case_id = case["case_id"]
+            current_study = case["current_study"]
+            prior_studies = case.get("prior_studies", [])
+            try:
+                relevances = predict_relevance_batch(current_study, prior_studies)
+            except Exception as e:
+                print(f"Error in case {case_id}: {e}")
+                relevances = [True] * len(prior_studies)
+            for prior, is_relevant in zip(prior_studies, relevances):
+                predictions.append({"case_id": case_id, "study_id": prior["study_id"], "predicted_is_relevant": is_relevant})
+        return JSONResponse(content={"predictions": predictions})
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        return JSONResponse(content={"predictions": []}, status_code=500)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "sklearn+lookup+llm"}
+    return {"status": "ok", "model": "sklearn+lookup"}
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
