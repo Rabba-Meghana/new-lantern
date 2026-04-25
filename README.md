@@ -23,10 +23,16 @@ python test_sanity.py                                 # 32 sanity checks, all mu
 uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-## ONNX Export (requires GPU + fine-tuned BiomedBERT)
+## BiomedBERT Fine-tuning (requires GPU)
 
 ```bash
-# After fine-tuning BiomedBERT (see experiments.md for Colab procedure)
+# Install training dependencies
+pip install -r requirements-train.txt
+
+# Fine-tune BiomedBERT (seed=42, ~15 mins on T4 GPU)
+python finetune_biomedbert.py --data relevant_priors_public.json --seed 42
+
+# Export to ONNX int8
 python train.py --data relevant_priors_public.json --export-onnx --bert-dir ./biomedbert_priors
 ```
 

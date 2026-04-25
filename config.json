@@ -1,14 +1,29 @@
 {
+    "_comment": "All thresholds and hyperparameters for the Relevant Priors pipeline. Edit here — no hard-coded values in inference or training code.",
+
+    "_sklearn_threshold_note": "Decision boundary for logistic regression (0-1). Lower = more recalls, higher = more precision. Tuned for 23.8% positive base rate.",
     "sklearn_threshold": 0.35,
+
+    "_onnx_threshold_note": "Decision boundary for ONNX+sklearn ensemble average (0-1).",
     "onnx_threshold": 0.40,
+
+    "_uncertainty_note": "sklearn predictions in [low, high] are sent to ONNX for ensemble. Outside this range sklearn alone decides.",
     "onnx_uncertainty_low": 0.25,
     "onnx_uncertainty_high": 0.60,
+
+    "_tfidf_note": "TF-IDF vectoriser settings. token_pattern [A-Z0-9]+ is set in code (not configurable here).",
     "tfidf_max_features": 8000,
     "tfidf_ngram_range": [1, 2],
+
+    "_lr_note": "Logistic regression hyperparameters. class_weight=balanced accounts for 23.8% positive base rate.",
     "lr_C": 1.0,
     "lr_max_iter": 1000,
     "lr_class_weight": "balanced",
+
+    "_lookup_note": "Minimum number of times a (cur_desc, pri_desc) pair must appear exclusively as true/false to be included in the lookup table.",
     "lookup_min_count": 2,
+
+    "_onnx_inference_note": "Batch size and max token length for ONNX inference.",
     "onnx_batch_size": 32,
     "onnx_max_length": 128
 }

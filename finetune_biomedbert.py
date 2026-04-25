@@ -35,8 +35,6 @@ from transformers import (
     TrainingArguments, Trainer, set_seed,
 )
 
-from features import build_features
-
 
 def load_data(data_path: str):
     with open(data_path) as f:
