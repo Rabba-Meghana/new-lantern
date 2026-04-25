@@ -3,6 +3,7 @@ import json
 import hashlib
 import pickle
 import logging
+import threading
 import numpy as np
 import scipy.sparse as sp
 from datetime import datetime
@@ -16,55 +17,54 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 cache = {}
 
-# ── Load sklearn model (fallback) ─────────────────────────────────────────────
+# ── sklearn (loads instantly, always available) ───────────────────────────────
 _model_path = os.path.join(os.path.dirname(__file__), "model.pkl")
 with open(_model_path, "rb") as f:
     _model = pickle.load(f)
 VECTORIZER = _model["vectorizer"]
 CLF        = _model["clf"]
-logger.info("sklearn model loaded OK")
+logger.info("sklearn loaded OK")
 
-# ── Load ONNX BiomedBERT (primary) ────────────────────────────────────────────
-ONNX_MODEL     = None
-ONNX_TOKENIZER = None
-ONNX_LOADED    = False
-
-try:
-    from optimum.onnxruntime import ORTModelForSequenceClassification
-    from transformers import AutoTokenizer
-    _onnx_dir = os.path.join(os.path.dirname(__file__), "onnx_int8")
-    ONNX_TOKENIZER = AutoTokenizer.from_pretrained(_onnx_dir)
-    ONNX_MODEL     = ORTModelForSequenceClassification.from_pretrained(_onnx_dir)
-    ONNX_LOADED    = True
-    logger.info("ONNX BiomedBERT loaded OK")
-except Exception as e:
-    logger.warning("ONNX load failed (%s) — using sklearn only", e)
-
-# ── Load empirical lookup table ───────────────────────────────────────────────
+# ── Lookup table ──────────────────────────────────────────────────────────────
 _lookup_path = os.path.join(os.path.dirname(__file__), "lookup.json")
 with open(_lookup_path) as f:
     _lookup_raw = json.load(f)
 LOOKUP_TRUE  = {(a, b) for a, b in _lookup_raw["true"]}
 LOOKUP_FALSE = {(a, b) for a, b in _lookup_raw["false"]}
-logger.info("Lookup: %d true, %d false pairs", len(LOOKUP_TRUE), len(LOOKUP_FALSE))
+logger.info("Lookup: %d true, %d false", len(LOOKUP_TRUE), len(LOOKUP_FALSE))
 
-# ── Keyword dictionaries ──────────────────────────────────────────────────────
+# ── ONNX loads in background thread ──────────────────────────────────────────
+ONNX_MODEL     = None
+ONNX_TOKENIZER = None
+ONNX_READY     = False
+
+def _load_onnx_background():
+    global ONNX_MODEL, ONNX_TOKENIZER, ONNX_READY
+    try:
+        from optimum.onnxruntime import ORTModelForSequenceClassification
+        from transformers import AutoTokenizer
+        _dir = os.path.join(os.path.dirname(__file__), "onnx_int8")
+        ONNX_TOKENIZER = AutoTokenizer.from_pretrained(_dir)
+        ONNX_MODEL     = ORTModelForSequenceClassification.from_pretrained(
+            _dir, file_name="model_quantized.onnx"
+        )
+        ONNX_READY = True
+        logger.info("ONNX BiomedBERT ready!")
+    except Exception as e:
+        logger.warning("ONNX load failed: %s — sklearn only", e)
+
+threading.Thread(target=_load_onnx_background, daemon=True).start()
+
+# ── Feature extraction ────────────────────────────────────────────────────────
 BODY_PARTS = {
-    "brain":          ["brain","head","cranial","cranium","intracranial","cerebr",
-                       "neuro","skull","orbit","sella","pituitary"],
+    "brain":          ["brain","head","cranial","cranium","intracranial","cerebr","neuro","skull","orbit","sella","pituitary"],
     "spine_cervical": ["cervical","c-spine","c spine"],
     "spine_thoracic": ["thoracic spine","t-spine","t spine"],
     "spine_lumbar":   ["lumbar","l-spine","l spine","lumbosacral","sacral"],
-    "chest":          ["chest","thorax","lung","pulmon","pleural","mediastin",
-                       "rib","heart","coronary","cardiac","spect","nm myo",
-                       "nmmyo","myocard"],
-    "abdomen":        ["abdomen","abdominal","liver","hepat","pancrea","spleen",
-                       "kidney","renal","adrenal","bowel","colon","rectum",
-                       "gallbladder","biliary","aaa"],
-    "pelvis":         ["pelvis","pelvic","bladder","prostate","uterus","ovary",
-                       "abd/pel","abd pel"],
-    "upper_ext":      ["shoulder","humerus","elbow","forearm","wrist","hand",
-                       "finger","clavicle"],
+    "chest":          ["chest","thorax","lung","pulmon","pleural","mediastin","rib","heart","coronary","cardiac","spect","nm myo","nmmyo","myocard"],
+    "abdomen":        ["abdomen","abdominal","liver","hepat","pancrea","spleen","kidney","renal","adrenal","bowel","colon","rectum","gallbladder","biliary","aaa"],
+    "pelvis":         ["pelvis","pelvic","bladder","prostate","uterus","ovary","abd/pel","abd pel"],
+    "upper_ext":      ["shoulder","humerus","elbow","forearm","wrist","hand","finger","clavicle"],
     "lower_ext":      ["hip","femur","knee","tibia","fibula","ankle","foot","toe"],
     "breast":         ["breast","mammograph","mammo","mam "],
     "neck":           ["neck","thyroid","soft tissue neck","parotid"],
@@ -120,13 +120,12 @@ def _build_features(cur_desc, cur_date, pri_desc, pri_date):
             int(years<=1), int(years<=3), int(years>10),
             int(po>0), int(mo>0), int(po>0 and mo>0)]
 
-# ── Targeted rules ────────────────────────────────────────────────────────────
-def _is_mam(d):     d=d.lower(); return any(k in d for k in ["mam ","mammo","mammograph","breast"])
-def _is_cxr(d):     d=d.lower(); return any(k in d for k in ["chest","cxr","frontal","pa/lat","thorax"]) and not _is_mam(d)
-def _is_ctchest(d): d=d.lower(); return "ct " in d and "chest" in d and "abd" not in d and "pelv" not in d
-def _is_ctabd(d):   d=d.lower(); return "ct " in d and any(k in d for k in ["abdomen","pelvis","abd/pel","abd pel"])
-def _is_mam_bi(d):  d=d.lower(); return _is_mam(d) and any(k in d for k in ["bilat","bilateral"," bi ","screen","3d"])
-def _is_mam_uni(d): d=d.lower(); return _is_mam(d) and not any(k in d for k in ["bilat","bilateral"," bi "]) and any(k in d for k in [" lt"," rt","left","right"])
+def _is_mam(d):     dl=d.lower(); return any(k in dl for k in ["mam ","mammo","mammograph","breast"])
+def _is_cxr(d):     dl=d.lower(); return any(k in dl for k in ["chest","cxr","frontal","pa/lat","thorax"]) and not _is_mam(d)
+def _is_ctchest(d): dl=d.lower(); return "ct " in dl and "chest" in dl and "abd" not in dl and "pelv" not in dl
+def _is_ctabd(d):   dl=d.lower(); return "ct " in dl and any(k in dl for k in ["abdomen","pelvis","abd/pel","abd pel"])
+def _is_mam_bi(d):  dl=d.lower(); return _is_mam(d) and any(k in dl for k in ["bilat","bilateral"," bi ","screen","3d"])
+def _is_mam_uni(d): dl=d.lower(); return _is_mam(d) and not any(k in dl for k in ["bilat","bilateral"," bi "]) and any(k in dl for k in [" lt"," rt","left","right"])
 
 def _targeted_rule(cur_desc, pri_desc):
     if _is_mam(cur_desc) and _is_cxr(pri_desc): return False
@@ -137,42 +136,29 @@ def _targeted_rule(cur_desc, pri_desc):
     if _is_mam_uni(cur_desc) and _is_mam_bi(pri_desc): return True
     return None
 
-# ── ONNX inference ────────────────────────────────────────────────────────────
-def _onnx_predict(cur_desc, prior_descs, threshold=0.35):
-    texts = [
-        f"Current exam: {cur_desc}. Prior exam: {pd}."
-        for pd in prior_descs
-    ]
+def _onnx_predict(cur_desc, pri_descs):
+    import torch
+    texts = [f"Current exam: {cur_desc}. Prior exam: {pd}." for pd in pri_descs]
     all_probs = []
-    batch_size = 32
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        enc = ONNX_TOKENIZER(
-            batch, truncation=True, padding=True,
-            max_length=128, return_tensors="pt"
-        )
-        import torch
+    for i in range(0, len(texts), 32):
+        batch = texts[i:i+32]
+        enc = ONNX_TOKENIZER(batch, truncation=True, padding=True, max_length=128, return_tensors="pt")
         with torch.no_grad():
-            logits = ONNX_MODEL(**enc).logits
-            probs  = torch.softmax(logits, dim=-1)[:, 1].numpy()
+            probs = torch.softmax(ONNX_MODEL(**enc).logits, dim=-1)[:, 1].numpy()
         all_probs.extend(probs.tolist())
-    return [bool(p >= threshold) for p in all_probs]
+    return all_probs
 
-# ── sklearn inference ─────────────────────────────────────────────────────────
-def _sklearn_predict(cur_desc, cur_date, need_ml):
-    texts = [f"CURRENT: {cur_desc} ||| PRIOR: {pd}" for _, pd, _, _ in need_ml]
-    metas = [_build_features(cur_desc, cur_date, pd, pdate) for _, pd, pdate, _ in need_ml]
+def _sklearn_probs(cur_desc, cur_date, items):
+    texts = [f"CURRENT: {cur_desc} ||| PRIOR: {pd}" for _, pd, _, _ in items]
+    metas = [_build_features(cur_desc, cur_date, pd, pdate) for _, pd, pdate, _ in items]
     try:
-        X = sp.hstack([VECTORIZER.transform(texts),
-                       sp.csr_matrix(np.array(metas, dtype=float))])
-        probs = CLF.predict_proba(X)[:, 1]
-        return [bool(p >= 0.35) for p in probs]
-    except Exception as exc:
-        logger.error("sklearn failed: %s", exc)
-        cur_parts = _get_parts(cur_desc)
-        return [bool(cur_parts & _get_parts(pd)) for _, pd, _, _ in need_ml]
+        X = sp.hstack([VECTORIZER.transform(texts), sp.csr_matrix(np.array(metas, dtype=float))])
+        return CLF.predict_proba(X)[:, 1].tolist()
+    except Exception as e:
+        logger.error("sklearn error: %s", e)
+        cp = _get_parts(cur_desc)
+        return [0.8 if cp & _get_parts(pd) else 0.2 for _, pd, _, _ in items]
 
-# ── Core pipeline ─────────────────────────────────────────────────────────────
 def _predict_batch(current_study, prior_studies):
     cur_desc = _safe_desc(current_study)
     cur_date = _safe_date(current_study)
@@ -182,7 +168,7 @@ def _predict_batch(current_study, prior_studies):
     for i, prior in enumerate(prior_studies):
         pri_desc = _safe_desc(prior)
         pri_date = _safe_date(prior)
-        ck       = _cache_key(cur_desc, pri_desc, pri_date)
+        ck = _cache_key(cur_desc, pri_desc, pri_date)
 
         if ck in cache:
             final[i] = cache[ck]; continue
@@ -200,24 +186,44 @@ def _predict_batch(current_study, prior_studies):
         need_ml.append((i, pri_desc, pri_date, ck))
 
     if need_ml:
-        pri_descs = [pd for _, pd, _, _ in need_ml]
+        # Get sklearn probabilities for all
+        sk_probs = _sklearn_probs(cur_desc, cur_date, need_ml)
 
-        if ONNX_LOADED:
-            try:
-                preds = _onnx_predict(cur_desc, pri_descs)
-            except Exception as exc:
-                logger.error("ONNX failed: %s — falling back to sklearn", exc)
-                preds = _sklearn_predict(cur_desc, cur_date, need_ml)
+        if ONNX_READY:
+            # Only send uncertain cases (0.25-0.60) to ONNX
+            uncertain = [(j, idx, item) for j, (sk_p, item) in enumerate(zip(sk_probs, need_ml))
+                        if 0.25 <= sk_p <= 0.60
+                        for idx in [item[0]]]
+            uncertain_descs = [need_ml[j][1] for j, _, _ in uncertain]
+
+            if uncertain_descs:
+                try:
+                    onnx_probs = _onnx_predict(cur_desc, uncertain_descs)
+                    for k, (j, orig_i, _) in enumerate(uncertain):
+                        # Ensemble: average sklearn + onnx
+                        final_prob = (sk_probs[j] + onnx_probs[k]) / 2
+                        pred = bool(final_prob >= 0.40)
+                        final[orig_i] = pred
+                        cache[need_ml[j][3]] = pred
+                except Exception as e:
+                    logger.error("ONNX inference failed: %s", e)
+                    uncertain = []  # fall through to sklearn
+
+            # Non-uncertain: use sklearn directly
+            for j, (orig_i, _, _, ck) in enumerate(need_ml):
+                if final[orig_i] is None:
+                    pred = bool(sk_probs[j] >= 0.35)
+                    final[orig_i] = pred
+                    cache[ck] = pred
         else:
-            preds = _sklearn_predict(cur_desc, cur_date, need_ml)
-
-        for j, (orig_i, _, _, ck) in enumerate(need_ml):
-            final[orig_i] = preds[j]
-            cache[ck]     = preds[j]
+            # ONNX not ready yet — use sklearn for everything
+            for j, (orig_i, _, _, ck) in enumerate(need_ml):
+                pred = bool(sk_probs[j] >= 0.35)
+                final[orig_i] = pred
+                cache[ck] = pred
 
     return [bool(r) if r is not None else False for r in final]
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.post("/predict")
 async def predict(request: Request):
     try:
@@ -229,15 +235,14 @@ async def predict(request: Request):
     if not isinstance(cases, list):
         raise HTTPException(status_code=400, detail="'cases' must be a list")
 
-    logger.info("Request: %d cases", len(cases))
+    logger.info("Request: %d cases | ONNX ready: %s", len(cases), ONNX_READY)
     predictions = []
 
     for case in cases:
         case_id       = case.get("case_id", "")
         current_study = case.get("current_study") or {}
         prior_studies = case.get("prior_studies") or []
-        if not isinstance(prior_studies, list):
-            prior_studies = []
+        if not isinstance(prior_studies, list): prior_studies = []
 
         logger.info("  case=%s priors=%d", case_id, len(prior_studies))
         relevances = _predict_batch(current_study, prior_studies)
@@ -256,7 +261,8 @@ async def predict(request: Request):
 def health():
     return {
         "status":     "ok",
-        "model":      "onnx_biomedbert" if ONNX_LOADED else "sklearn",
+        "onnx_ready": ONNX_READY,
+        "model":      "sklearn+onnx_ensemble" if ONNX_READY else "sklearn",
         "cache_size": len(cache),
     }
 
